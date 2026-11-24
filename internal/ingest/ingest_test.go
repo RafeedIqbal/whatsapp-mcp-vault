@@ -392,3 +392,21 @@ func TestAHeadRequestDoesNotUseUpTheDownload(t *testing.T) {
 		t.Fatalf("HEAD after the download: status %d, want 404", again.StatusCode)
 	}
 }
+
+func TestIdleTransfersReleaseBytesAtExpiry(t *testing.T) {
+	transfers := NewTransfers("https://example.test", 100, 200, 10*time.Millisecond)
+	if _, _, err := transfers.OfferDownload(Blob{Data: []byte("test")}); err != nil {
+		t.Fatal(err)
+	}
+	go transfers.Run(t.Context())
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		transfers.mu.Lock()
+		empty := transfers.total == 0 && len(transfers.items) == 0
+		transfers.mu.Unlock()
+		if empty {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("expired payload retained without traffic")
+}

@@ -164,6 +164,7 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		fmt.Fprintln(os.Stderr, "WhatsApp Business label sync and tools are enabled")
 	}
 	files := newFiles("http://" + addr)
+	go files.Transfers.Run(ctx)
 	mcpServer.SetFiles(files)
 	mcpServer.SetSendConfirmation(policy.effectiveConfirm())
 	d.SetMCPMount(func(mux *http.ServeMux) {

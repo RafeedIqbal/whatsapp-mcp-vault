@@ -37,7 +37,7 @@ This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-
 ### Invariants worth knowing before changing things
 
 - A retired or revoked token must not keep a sealed key: rotation blanks `wrapped_key`, revocation deletes rows, and the replacement pair kept for retries is dropped after the grace window (`oauth.Store`).
-- The owner page holds the key in memory too (`gateway` owner sessions). They expire on a timer (`Gateway.Run`), not only on the next request.
+- The owner session stores a one-way cookie ID and a key sealed under the browser cookie. Sessions expire on the configured idle timer even without a further request.
 - The recovery code is accepted wherever the passphrase is (`vault.Meta.Unlock`) and is never subject to the wrong-guess pause.
 - Only `s.whatsapp.net`, `lid` and `g.us` addresses are send targets (`client.checkSendRate`); a chat is "known" under either its phone-number or hidden-ID form (`IsNewRecipient`).
 - The session manager must always return to `locked`: unlocking has a deadline and recovers from panics; a failed WhatsApp connection does not fail the unlock (the archive stays readable and connecting is retried).

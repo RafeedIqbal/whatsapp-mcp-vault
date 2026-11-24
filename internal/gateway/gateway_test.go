@@ -532,16 +532,16 @@ func TestExtraRoutesAreServedWithoutUnlocking(t *testing.T) {
 
 // --- owner key lifetime ----------------------------------------------------
 
-// An owner sign-in keeps the key in memory so the pairing pages work. It must
+// The sealed owner session must
 // be dropped when idle even if the owner simply closes the tab and never
 // sends another request.
 func TestOwnerKeyIsForgottenWhenIdleWithNoFurtherRequest(t *testing.T) {
-	f := newFixture(t)
+	f := newFixture(t, func(c *Config[*fakeRuntime]) { c.OwnerIdle = 3 * time.Minute })
 	f.setUp()
 	if n := f.gw.ownerCount(); n != 1 {
 		t.Fatalf("owner sessions after setup = %d, want 1", n)
 	}
-	f.now = f.now.Add(ownerIdle - time.Minute)
+	f.now = f.now.Add(2 * time.Minute)
 	f.gw.ExpireOwners()
 	if f.gw.ownerCount() != 1 {
 		t.Fatal("an owner session was dropped before it was idle")

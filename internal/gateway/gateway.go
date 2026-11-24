@@ -59,6 +59,7 @@ type Config[R Runtime] struct {
 	SetupToken string
 	// SecureCookies marks the owner cookie Secure (set when served over https).
 	SecureCookies bool
+	OwnerIdle     time.Duration
 	// RevokeAll ends every app's sign-in (oauth.Store.RevokeAll).
 	RevokeAll func(ctx context.Context) error
 	// Extra mounts further always-available routes (the one-time upload page
@@ -83,12 +84,15 @@ type Gateway[R Runtime] struct {
 }
 
 type ownerSession struct {
-	key      vault.Key
-	lastUsed time.Time
+	wrappedKey []byte
+	lastUsed   time.Time
 }
 
 // New returns a gateway for cfg.
 func New[R Runtime](cfg Config[R]) *Gateway[R] {
+	if cfg.OwnerIdle <= 0 {
+		cfg.OwnerIdle = ownerIdle
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -202,18 +206,22 @@ func (g *Gateway[R]) ownerKey(r *http.Request) (vault.Key, bool) {
 	defer g.mu.Unlock()
 	now := g.cfg.Now()
 	g.expireOwnersLocked(now)
-	s, ok := g.owners[c.Value]
+	secret := []byte(c.Value)
+	s, ok := g.owners[vault.SecretID(secret, ownerCookieName)]
 	if !ok {
 		return vault.Key{}, false
 	}
+	key, err := vault.UnwrapWithSecret(s.wrappedKey, secret, ownerCookieName)
+	if err != nil {
+		return vault.Key{}, false
+	}
 	s.lastUsed = now
-	return s.key, true
+	return key, true
 }
 
 func (g *Gateway[R]) expireOwnersLocked(now time.Time) {
 	for id, s := range g.owners {
-		if now.Sub(s.lastUsed) >= ownerIdle {
-			s.key = vault.Key{}
+		if now.Sub(s.lastUsed) >= g.cfg.OwnerIdle {
 			delete(g.owners, id)
 		}
 	}
@@ -254,10 +262,7 @@ func (g *Gateway[R]) ownerCount() int {
 func (g *Gateway[R]) forgetOwners() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for id, s := range g.owners {
-		s.key = vault.Key{}
-		delete(g.owners, id)
-	}
+	clear(g.owners)
 }
 
 // forgetOwner ends the owner sign-in the request carries, if any.
@@ -268,10 +273,7 @@ func (g *Gateway[R]) forgetOwner(r *http.Request) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if s, ok := g.owners[c.Value]; ok {
-		s.key = vault.Key{}
-		delete(g.owners, c.Value)
-	}
+	delete(g.owners, vault.SecretID([]byte(c.Value), ownerCookieName))
 }
 
 func (g *Gateway[R]) clearOwnerCookie(w http.ResponseWriter) {
@@ -279,13 +281,19 @@ func (g *Gateway[R]) clearOwnerCookie(w http.ResponseWriter) {
 		HttpOnly: true, Secure: g.cfg.SecureCookies, SameSite: http.SameSiteStrictMode})
 }
 
-// signOwnerIn starts an owner session holding key and sets its cookie.
+// signOwnerIn keeps only a sealed key and the one-way ID of its browser cookie.
 func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return errors.New("gateway: could not read random bytes")
 	}
-	id := base64.RawURLEncoding.EncodeToString(raw)
+	cookie := base64.RawURLEncoding.EncodeToString(raw)
+	secret := []byte(cookie)
+	wrapped, err := vault.WrapWithSecret(key, secret, ownerCookieName)
+	if err != nil {
+		return err
+	}
+	id := vault.SecretID(secret, ownerCookieName)
 	g.mu.Lock()
 	now := g.cfg.Now()
 	g.expireOwnersLocked(now)
@@ -298,10 +306,10 @@ func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 		}
 		delete(g.owners, oldest)
 	}
-	g.owners[id] = &ownerSession{key: key, lastUsed: now}
+	g.owners[id] = &ownerSession{wrappedKey: wrapped, lastUsed: now}
 	g.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
-		Name: ownerCookieName, Value: id, Path: "/",
+		Name: ownerCookieName, Value: cookie, Path: "/",
 		HttpOnly: true, Secure: g.cfg.SecureCookies, SameSite: http.SameSiteStrictMode,
 	})
 	return nil

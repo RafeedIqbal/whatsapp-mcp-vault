@@ -3,7 +3,7 @@ module github.com/sealjay/mcp-whatsapp
 go 1.26.0
 
 require (
-	github.com/mark3labs/mcp-go v1.3.0
+	github.com/mark3labs/mcp-go v1.6.0
 	github.com/mdp/qrterminal v1.0.1
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
