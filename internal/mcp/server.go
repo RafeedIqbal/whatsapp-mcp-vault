@@ -45,6 +45,22 @@ func NewReadOnlyServer(c *client.Client, cache pairingCache, labelsEnabled bool)
 	return newServer(c, cache, true, labelsEnabled)
 }
 
+// NewServerWithAccess exposes only the tools a signed-in client was granted:
+// read-only tools always, send and manage tools only with those grants.
+// Calling a tool outside the grant fails as an unknown tool.
+func NewServerWithAccess(c *client.Client, cache pairingCache, labelsEnabled bool, access Access) *Server {
+	if !access.Send && !access.Manage {
+		return newServer(c, cache, true, labelsEnabled)
+	}
+	s := newServer(c, cache, false, labelsEnabled)
+	for name := range s.mcp.ListTools() {
+		if !access.allows(name) {
+			s.mcp.DeleteTools(name)
+		}
+	}
+	return s
+}
+
 func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool) *Server {
 	instructions := ""
 	if readOnly {

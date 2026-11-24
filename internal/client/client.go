@@ -59,6 +59,7 @@ type Client struct {
 	sendMediaRetry   func(context.Context, *types.MessageInfo, []byte) error
 	store            *store.Store
 	session          *sessionStore // whatsmeow's own database; closed by Close
+	offline          offlineSync   // set once the post-connect backlog has arrived
 	log              waLog.Logger
 	handlerID        uint32
 	handlerInstalled bool

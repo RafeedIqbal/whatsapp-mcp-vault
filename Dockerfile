@@ -28,10 +28,11 @@ USER app
 WORKDIR /home/app
 RUN mkdir -p /home/app/store
 
-# Loopback-only by default, matching the binary's own default. Reaching this
-# from outside the container (docker run -p) needs the app's own remote-bind
-# opt-in: override CMD with `-addr 0.0.0.0:8765 -allow-remote` and set
-# WHATSAPP_MCP_TOKEN — see README.md.
+# Loopback-only by default, matching the binary's own default. To host it,
+# override CMD with `serve -addr 0.0.0.0:8765 -allow-remote` and set
+# PUBLIC_URL (the https address clients use) and SETUP_TOKEN (the one-time
+# code the owner enters at /setup). Do not set WHATSAPP_MCP_VAULT_KEY when
+# hosting: the key is created at setup and never stored in usable form.
 EXPOSE 8765
 VOLUME ["/home/app/store"]
 

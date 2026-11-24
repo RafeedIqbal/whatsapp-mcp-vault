@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/sealjay/mcp-whatsapp/internal/client"
@@ -65,16 +66,13 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		return 2
 	}
 
-	// When binding to a non-loopback address we require a shared bearer
-	// token. Loopback-only operation intentionally keeps no token so local
-	// editors and curl can hit the daemon without extra setup.
-	var authToken string
-	if allowRemote {
-		authToken = os.Getenv("WHATSAPP_MCP_TOKEN")
-		if authToken == "" {
-			fmt.Fprintln(os.Stderr, "-allow-remote requires WHATSAPP_MCP_TOKEN to be set in the environment")
-			return 2
-		}
+	// Two modes. With the data key in the environment the server is a local
+	// development daemon (loopback only, no sign-in). Without it, the server
+	// uses passphrase sign-in and may be exposed: see vaultserve.go.
+	envKeyMode := strings.TrimSpace(os.Getenv(vaultKeyEnv)) != ""
+	if err := checkServeMode(envKeyMode, allowRemote); err != nil {
+		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
+		return 2
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -103,6 +101,18 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	// Operator UX: make the media root obvious on boot so users know where
 	// to drop outbound attachments.
 	fmt.Fprintf(os.Stderr, "media root: %s (drop outbound files here)\n", allowedMediaRoot)
+
+	if !envKeyMode {
+		return runVaultServe(ctx, vaultServeOptions{
+			storeDir:         storeDir,
+			addr:             addr,
+			redactor:         redactor,
+			allowedMediaRoot: allowedMediaRoot,
+			readOnly:         readOnly,
+			labelsEnabled:    labelsEnabled,
+			fullHistory:      fullHistory,
+		})
+	}
 
 	vaultKey, keyErr := vaultKeyFromEnv(os.Getenv)
 	if keyErr != nil {
@@ -140,9 +150,8 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	// to the MCP server (so pairing_status can surface the live QR), then
 	// mount the MCP HTTP handler back onto the daemon.
 	d, err := daemon.New(daemon.Config{
-		Addr:      addr,
-		Driver:    drv,
-		AuthToken: authToken,
+		Addr:   addr,
+		Driver: drv,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "daemon.New: %v\n", err)

@@ -20,6 +20,9 @@ func (c *Client) ConnectionStatus() ConnectionStatus {
 }
 
 func (c *Client) trackConnectionEvent(event any) {
+	if _, ok := event.(*events.OfflineSyncCompleted); ok {
+		c.offline.mark()
+	}
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
 	state := ""

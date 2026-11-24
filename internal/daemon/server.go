@@ -101,10 +101,11 @@ func (s *Server) BoundAddr() string {
 	return s.boundAddr
 }
 
-// Run starts the HTTP listener, begins the pairing state machine, and
-// blocks until ctx is cancelled. On cancel, performs the shutdown
-// sequence: drain HTTP → Disconnect driver.
-func (s *Server) Run(ctx context.Context) error {
+// Handler returns the daemon's routes (pairing pages, probes and the mounted
+// MCP endpoint) with no authentication, origin check or listener of their
+// own. Run wraps it for the standalone loopback daemon; the sign-in gateway
+// serves it behind its own checks once the instance is unlocked.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	var coder pairCoder
 	if pc, ok := s.cfg.Driver.(pairCoder); ok {
@@ -133,6 +134,21 @@ func (s *Server) Run(ctx context.Context) error {
 			http.Error(w, "mcp not mounted", http.StatusServiceUnavailable)
 		})
 	}
+	return mux
+}
+
+// Boot drives the pairing state machine: it connects with the existing
+// session, or starts pairing when there is none. Call it once.
+func (s *Server) Boot(ctx context.Context) error { return s.bootDriver(ctx) }
+
+// Shutdown disconnects from WhatsApp.
+func (s *Server) Shutdown() { s.cfg.Driver.Disconnect() }
+
+// Run starts the HTTP listener, begins the pairing state machine, and
+// blocks until ctx is cancelled. On cancel, performs the shutdown
+// sequence: drain HTTP → Disconnect driver.
+func (s *Server) Run(ctx context.Context) error {
+	mux := s.Handler()
 
 	rootHandler := requestLimitMiddleware(originMiddleware(authMiddleware(mux, s.cfg.AuthToken)))
 

@@ -4,15 +4,31 @@ Single Go binary that runs as an HTTP MCP daemon (default `127.0.0.1:8765`) wrap
 
 ## Fork status: locked-vault build (in progress)
 
-This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-per-person server. The approved plan and the progress ledger live outside the tree (`.superpowers/sdd/.../progress.md`, git-ignored). Done so far (milestone 1):
+This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-per-person server. The approved plan and the progress ledger live outside the tree (`.superpowers/sdd/.../progress.md`, git-ignored).
 
-- **Everything on disk is SQLCipher-encrypted.** `internal/vault` owns the instance key and opens both databases (`vault.OpenDB`); `store.Open(dir, key)` and `client.Config.Key` require it. There is no plaintext mode: a build without the cipher, a missing key, or a wrong key is a hard error. Driver: `github.com/mutecomm/go-sqlcipher/v4` (it registers as `sqlite3`; do not add `mattn/go-sqlite3`, the two cannot be linked together).
-- **Key source (interim):** env `WHATSAPP_MCP_VAULT_KEY`, 64 hex chars, read by `cmd/whatsapp-mcp/vaultkey.go`. The plan replaces this with a passphrase/OAuth-token-wrapped key and connect-on-demand (milestones 2 and 3).
+### Two modes of `serve`
+
+- **Passphrase sign-in (hosted; the default when `WHATSAPP_MCP_VAULT_KEY` is unset).** `cmd/whatsapp-mcp/vaultserve.go`. The instance key is created at first-time setup and stored only as sealed copies ("wraps"): under the owner's passphrase (Argon2id), a recovery code, and every OAuth code and token. While locked the process holds no key, no open database and no WhatsApp connection. A request with a valid access token (or the owner's passphrase at `/setup`) unlocks it; it locks again after `IDLE_LOCK` (default 15m) without use. Needs `PUBLIC_URL` (https unless loopback; `RENDER_EXTERNAL_URL` is used as a fallback) and `SETUP_TOKEN` (one-time code for `/setup`; empty disables setup). `OAUTH_REDIRECT_ALLOWLIST` adds exact https callbacks.
+- **Key in environment (local development only).** `WHATSAPP_MCP_VAULT_KEY` = 64 hex chars. No sign-in, loopback only: combining it with `-allow-remote` is refused. The e2e harness and the legacy loopback daemon use this.
+
+### Packages added
+
+- `internal/vault`: `Key`, per-database subkeys, `OpenDB` (SQLCipher; no plaintext mode; driver `github.com/mutecomm/go-sqlcipher/v4`, which registers as `sqlite3`; do not add `mattn/go-sqlite3`, the two cannot be linked together), key wrapping (`wrap.go`), and `Meta` (`meta.go`): the one deliberately unencrypted database, `meta.db`, holding setup state, sealed key copies, the wrong-guess counter and the sign-in records. Nothing in it is a usable secret.
+- `internal/oauth`: the instance's own OAuth 2.1 server. `store.go` keeps clients, one-time codes and tokens as one-way IDs plus the key sealed under that credential; refresh rotation has a 60 s grace window and revokes the whole chain on later reuse. `server.go` serves the RFC 9728 / RFC 8414 documents, dynamic client registration (callback allowlist: Claude's callbacks and loopback), the consent page (passphrase plus permission ticks), `/token` (PKCE S256, resource binding) and bearer checking.
+- `internal/session`: `Manager` builds the whole runtime on unlock and tears it down on idle lock; it never locks under a running request.
+- `internal/gateway`: the always-on front door. Serves `/healthz`, `/readyz` (both mean "process up"; locked is the resting state), sign-in, `/setup`, and lets `/mcp` through only with a valid token and `/pair` only with an owner sign-in.
+
+### Other changes
+
+- **Permissions.** Tools are in three tiers: read (`readOnlyToolAccess`), manage (`manageToolAccess`: groups, blocks, privacy, profile) and send (everything else). `mcp.NewServerWithAccess` exposes only what a token's scope grants (`whatsapp.read` always, `whatsapp.send`, `whatsapp.manage`). A new tool with no classification is treated as send-tier.
 - **Search** uses an FTS4 index (`internal/store/search.go`), kept in step by triggers; FTS4 rather than FTS5 so no build tag is needed.
 - **Decrypted media is never written to disk.** `client.Download*` return bytes (`DownloadResult.Data`, 64 MiB cap); `download_media` returns image/audio blocks or an embedded resource (5 MiB cap) and has no `output_path`.
+- **Shutdown and locking** close the session database with a checkpoint (`client.Client.Close`). Per-message log lines are DEBUG only.
 - Tests that need a store use `vaulttest.Key()`; fixtures that seed a database file by hand use `vaulttest.OpenDB`.
 
-Not done yet: OAuth sign-in and setup page, connect-on-demand, attachments by URL/upload (send tools still take server file paths under `WHATSAPP_MCP_MEDIA_ROOT`), per-permission tool filtering, send safety changes, hosting files. Sections below still describe upstream behaviour where they have not been touched.
+### Not done yet
+
+Client ID metadata documents (only dynamic registration today), attachments by URL or upload (send tools still take server file paths under `WHATSAPP_MCP_MEDIA_ROOT`, which is useless when hosted), download links for media over 5 MiB, send-safety changes (new-recipient block, draft/confirm), hosting files (`render.yaml`), and a migration path for a store created in key-in-environment mode. Sections below still describe upstream behaviour where they have not been touched.
 
 ## Structure
 
