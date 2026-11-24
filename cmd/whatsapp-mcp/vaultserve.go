@@ -189,7 +189,7 @@ func connectWithRetry(ctx context.Context, connect func(context.Context) error, 
 }
 
 // buildRuntime returns the function that brings the instance up from its key.
-func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instance, error) {
+func buildRuntime(o vaultServeOptions, publicURL string) func(context.Context, vault.Key) (*instance, error) {
 	return func(ctx context.Context, key vault.Key) (*instance, error) {
 		st, err := store.Open(o.storeDir, key)
 		if err != nil {
@@ -224,9 +224,9 @@ func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instan
 			return fail(fmt.Errorf("init pairing: %w", err))
 		}
 
-		rt := &instance{drafts: o.drafts, st: st, c: c, d: d, cancel: cancel, owner: d.Handler(), tools: map[mcpsrv.Access]http.Handler{}, files: o.files}
+		rt := &instance{drafts: o.drafts, st: st, c: c, d: d, cancel: cancel, owner: gateway.OwnerPages(d.Handler(), st), tools: map[mcpsrv.Access]http.Handler{}, files: o.files}
 		for _, access := range []mcpsrv.Access{{}, {Send: true}, {Manage: true}, {Send: true, Manage: true}} {
-			tools := mcpsrv.NewServerWithAccess(c, d.Cache(), o.labelsEnabled, access)
+			tools := mcpsrv.NewServerWithAccess(c, d.Cache(), o.labelsEnabled, access, publicURL)
 			tools.SetFiles(o.files)
 			if o.drafts != nil {
 				tools.SetDraftStore(o.drafts)
@@ -298,7 +298,7 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 	// meta.Unlock takes the passphrase or the recovery code; the recovery code
 	// is never paused by wrong guesses, so the owner always has a way in.
 	signIn := oauth.NewServer(oauth.Config{Issuer: publicURL, Store: tokens, Unlock: meta.Unlock, ExtraRedirectURIs: extraRedirects})
-	sessions := session.New(buildRuntime(o), idle)
+	sessions := session.New(buildRuntime(o, publicURL), idle)
 	gw := gateway.New(gateway.Config[*instance]{
 		Meta:       meta,
 		OAuth:      signIn,

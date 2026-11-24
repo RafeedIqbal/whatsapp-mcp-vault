@@ -202,6 +202,7 @@ func (s *Server) registerGetChat() {
 // -- get_message_context ----------------------------------------------------
 
 type getMessageContextArgs struct {
+	ChatJID   string `json:"chat_jid,omitempty"`
 	MessageID string `json:"message_id"`
 	Before    int    `json:"before,omitempty"`
 	After     int    `json:"after,omitempty"`
@@ -211,6 +212,7 @@ func (s *Server) registerGetMessageContext() {
 	tool := mcp.NewTool("get_message_context",
 		mcp.WithDescription(offlineSafePrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it; messages carry `edited: true` when edited, and `revoked: true` with `revoked_at` when deleted for everyone (their text and media are kept)."),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the target message (use `message_id` from list_messages)")),
+		mcp.WithString("chat_jid", mcp.Description(jidDesc+"; required when the message ID occurs in multiple chats")),
 		mcp.WithNumber("before", mcp.DefaultNumber(5), mcp.Description("messages to fetch before the target (default 5; non-positive values fall back to the default)")),
 		mcp.WithNumber("after", mcp.DefaultNumber(5), mcp.Description("messages to fetch after the target (default 5; non-positive values fall back to the default)")),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -226,7 +228,11 @@ func (s *Server) registerGetMessageContext() {
 		if after <= 0 {
 			after = 5
 		}
-		ctxResult, err := s.client.Store().GetMessageContext(ctx, a.MessageID, before, after)
+		chatJID := normalizeRecipientToChatJID(a.ChatJID)
+		if a.ChatJID != "" && chatJID == "" {
+			return mcp.NewToolResultError("chat_jid must be a chat JID or phone digits"), nil
+		}
+		ctxResult, err := s.client.Store().GetMessageContextInChat(ctx, a.MessageID, chatJID, before, after)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

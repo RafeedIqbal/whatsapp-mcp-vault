@@ -96,7 +96,7 @@ make upgrade-check
 
 ## Feature implementation map
 
-The MCP tool surface has 43 tools by default and 47 when the four WhatsApp Business label tools are enabled with `serve -enable-labels` or `WHATSAPP_MCP_LABELS=1`. Read-only mode exposes 15 tools by default or 19 when labels are enabled. The label tools are read-only; transcription is excluded from read-only mode because it uploads private audio to another service.
+Hosted grants with full access expose 47 tools, or 51 with Business labels. Read-only hosted grants expose 17 or 21. The local key mode exposes 45 or 49 tools with full access and 15 or 19 in read-only mode. The hosted-only `search` and `fetch` tools use stable opaque IDs in the encrypted archive and `/sources/{id}` requires an owner session. The label tools are read-only; transcription is excluded from read-only mode because it uploads private audio to another service.
 
 1. **LID resolution** — `internal/store/lid.go` normalises `@lid` JIDs to real phone numbers via `whatsmeow_lid_map`.
 2. **Sent-message storage** — `internal/client/send.go` persists outgoing messages after `SendMessage` returns.

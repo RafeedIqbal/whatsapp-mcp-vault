@@ -23,6 +23,7 @@ import (
 
 	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 	"github.com/sealjay/mcp-whatsapp/internal/session"
+	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"github.com/sealjay/mcp-whatsapp/internal/vault"
 )
 
@@ -129,6 +130,7 @@ func (g *Gateway[R]) Handler() http.Handler {
 	mux.HandleFunc("POST /setup", g.handleSetupSubmit)
 	mux.HandleFunc("/pair", g.handleOwner)
 	mux.HandleFunc("/pair/", g.handleOwner)
+	mux.HandleFunc("GET "+store.SourcePath+"{id}", g.handleOwner)
 	return mux
 }
 
@@ -170,9 +172,18 @@ func (g *Gateway[R]) handleOwner(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cross-site request refused", http.StatusForbidden)
 		return
 	}
+	signIn := "/setup"
+	if id := r.PathValue("id"); id != "" {
+		oauth.PageHeaders(w, "")
+		if !store.ValidSourceID(id) {
+			http.NotFound(w, r)
+			return
+		}
+		signIn += "?source=" + id
+	}
 	key, ok := g.ownerKey(r)
 	if !ok {
-		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		http.Redirect(w, r, signIn, http.StatusSeeOther)
 		return
 	}
 	rt, release, err := g.cfg.Sessions.Acquire(r.Context(), key)
@@ -322,6 +333,7 @@ func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 // --- setup -----------------------------------------------------------------
 
 type setupView struct {
+	Source      string
 	Endpoint    string
 	Connections []oauth.Connection
 	Mode        string // "init", "login", "recover", "owner", "recovery", "disabled"
@@ -343,6 +355,11 @@ func (g *Gateway[R]) handleSetupPage(w http.ResponseWriter, r *http.Request) {
 		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "init"})
 	default:
 		if _, ok := g.ownerKey(r); ok {
+			if id := r.URL.Query().Get("source"); store.ValidSourceID(id) {
+				oauth.PageHeaders(w, "")
+				http.Redirect(w, r, store.SourcePath+id, http.StatusSeeOther)
+				return
+			}
 			g.renderSetup(r, w, http.StatusOK, setupView{Mode: "owner"})
 			return
 		}
@@ -458,7 +475,12 @@ func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
 		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "login", Error: "Sign-in failed because of a server error."})
 		return
 	}
-	http.Redirect(w, r, "/pair", http.StatusSeeOther)
+	destination := "/pair"
+	if id := r.PostForm.Get("source"); store.ValidSourceID(id) {
+		destination = store.SourcePath + id
+	}
+	oauth.PageHeaders(w, "")
+	http.Redirect(w, r, destination, http.StatusSeeOther)
 }
 
 // handleRecover lets the owner back in with the recovery code and sets a new
@@ -590,6 +612,9 @@ func (g *Gateway[R]) recordSetupFailure() {
 }
 
 func (g *Gateway[R]) renderSetup(r *http.Request, w http.ResponseWriter, status int, v setupView) {
+	if id := r.FormValue("source"); v.Mode == "login" && store.ValidSourceID(id) {
+		v.Source = id
+	}
 	if v.Mode == "owner" {
 		v.Endpoint = g.cfg.OAuth.Resource()
 		var err error
@@ -636,10 +661,11 @@ a.button{display:inline-block;text-decoration:none;font-size:1rem;padding:.6rem 
 <p class="code">{{.Recovery}}</p>
 <p><a class="button" href="/pair">I have saved it: link WhatsApp</a></p>
 {{else if eq .Mode "login"}}
-<h1>Sign in to manage this connector</h1>
-<p class="who">Enter your passphrase to link or re-link WhatsApp.</p>
+{{if .Source}}<h1>Sign in to view this message</h1>{{else}}<h1>Sign in to manage this connector</h1>
+<p class="who">Enter your passphrase to link or re-link WhatsApp.</p>{{end}}
 <form method="post" action="/setup" autocomplete="off">
 <input type="hidden" name="action" value="login">
+{{if .Source}}<input type="hidden" name="source" value="{{.Source}}">{{end}}
 <label for="passphrase">Your passphrase</label>
 <input type="password" id="passphrase" name="passphrase" required autofocus autocomplete="current-password">
 <button class="primary" type="submit">Sign in</button>

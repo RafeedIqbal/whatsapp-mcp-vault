@@ -21,7 +21,7 @@ func testFiles(fetch func(context.Context, string) (ingest.Blob, error)) *Files 
 }
 
 func serverWithFiles(access Access, f *Files) *Server {
-	s := NewServerWithAccess(nil, nil, false, access)
+	s := NewServerWithAccess(nil, nil, false, access, "https://wa.example.test")
 	s.SetFiles(f)
 	return s
 }
@@ -112,7 +112,7 @@ func TestUploadedAttachmentIsTakenOnce(t *testing.T) {
 }
 
 func TestLinksAndUploadsNeedTheFileServiceButInlineDoesNot(t *testing.T) {
-	s := NewServerWithAccess(nil, nil, false, Access{Send: true}) // no SetFiles
+	s := NewServerWithAccess(nil, nil, false, Access{Send: true}, "https://wa.example.test") // no SetFiles
 	if _, err := s.resolveAttachment(context.Background(), attachmentSource{URL: "https://example.com/a.png"}); err == nil {
 		t.Error("a link was accepted with no fetcher configured")
 	}
@@ -218,7 +218,7 @@ func TestCreateUploadLinkIsASendTierTool(t *testing.T) {
 		t.Error("a sign-in with sending cannot create upload links")
 	}
 	// Without the file service the tool says so instead of pretending.
-	if text, isErr := callTool(t, NewServerWithAccess(nil, nil, false, Access{Send: true}), "create_upload_link", nil); !isErr {
+	if text, isErr := callTool(t, NewServerWithAccess(nil, nil, false, Access{Send: true}, "https://wa.example.test"), "create_upload_link", nil); !isErr {
 		t.Errorf("create_upload_link succeeded with no upload store: %s", text)
 	}
 }
@@ -291,7 +291,7 @@ var _ = mcp.NewTextContent // keep the import used if helpers change
 // use and stop it from ever locking when idle.
 func TestToolEndpointOffersNoLongLivedStream(t *testing.T) {
 	mux := http.NewServeMux()
-	NewServerWithAccess(nil, nil, false, Access{}).AttachHTTP(mux)
+	NewServerWithAccess(nil, nil, false, Access{}, "https://wa.example.test").AttachHTTP(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 

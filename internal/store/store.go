@@ -445,14 +445,19 @@ func migrateSchema(db *sql.DB) error {
 	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version > 1 {
+	if version > 2 {
 		return fmt.Errorf("unsupported archive schema version %d", version)
 	}
 	if version == 0 {
 		if err := migrateArchive(tx); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("PRAGMA user_version=1"); err != nil {
+	}
+	if version < 2 {
+		if _, err := tx.Exec(messageSourcesSchema); err != nil {
+			return fmt.Errorf("index message sources: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version=2"); err != nil {
 			return err
 		}
 	}

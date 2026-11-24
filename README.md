@@ -1,9 +1,9 @@
 # WhatsApp MCP Server
 
 > [!IMPORTANT]
-> **This is a work-in-progress fork of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp)** (MIT), being reworked into a hosted server where each person runs their own private instance and everything on disk is encrypted. It is not affiliated with the upstream project, WhatsApp or Meta.
+> This fork of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp) gives one person a private WhatsApp vault that ChatGPT and Claude can share. SQLCipher encrypts the message archive and device database. A separate sign-in database holds credential identifiers and sealed keys.
 >
-> To host it, see [docs/hosting.md](docs/hosting.md). What has changed, and what has not been built yet, is listed under "Fork status" in [AGENTS.md](AGENTS.md). The rest of this README, including the badges and install instructions below, still describes the upstream project and has not been updated.
+> [Connect both assistants](docs/hosting.md#connect-chatgpt-and-claude-to-one-account) · [Repository audit](docs/audit.md)
 >
 > This server links to WhatsApp as an unofficial linked device. That is against WhatsApp's Terms of Service and can get an account restricted or banned. Use it at your own risk.
 
@@ -11,11 +11,11 @@
 [![CI](https://github.com/RafeedIqbal/whatsapp-mcp-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/RafeedIqbal/whatsapp-mcp-vault/actions/workflows/ci.yml)
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![MCP](https://img.shields.io/badge/MCP-protocol-6366f1)](https://modelcontextprotocol.io/)
-[![43 tools](https://img.shields.io/badge/tools-43-blue)](#tools)
+[![47 hosted tools](https://img.shields.io/badge/hosted_tools-47-blue)](#tools)
 [![whatsmeow](https://img.shields.io/badge/whatsmeow-multidevice-25D366?logo=whatsapp&logoColor=white)](https://github.com/tulir/whatsmeow)
 [![GitHub issues](https://img.shields.io/github/issues/RafeedIqbal/whatsapp-mcp-vault)](https://github.com/RafeedIqbal/whatsapp-mcp-vault/issues)
 
-A local-first WhatsApp [MCP](https://modelcontextprotocol.io/) server for AI assistants, built as a single Go binary. Search cached conversations, send messages, manage groups and work with media through your own WhatsApp account. One HTTP daemon maintains the connection and local SQLite cache, and multiple MCP clients can share it.
+A local-first WhatsApp [MCP](https://modelcontextprotocol.io/) server for AI assistants, built as a single Go binary. Search cached conversations, send messages, manage groups and work with media through your own WhatsApp account. One HTTP daemon maintains the connection and encrypted SQLite cache, and multiple MCP clients can share it.
 
 `whatsapp-mcp serve` listens on `127.0.0.1:8765`, serves MCP at `/mcp` and hosts a pairing page at `/pair`. It is built on [whatsmeow](https://github.com/tulir/whatsmeow).
 
@@ -28,7 +28,7 @@ What you can do with it:
 - Transcribe voice notes through a speech-to-text service you configure (opt-in).
 - Run with `serve -read-only` to exclude message-sending and account-mutation tools.
 
-There are 43 tools advertised by default. That count includes `transcribe_audio`, which needs a speech-to-text endpoint before it can work. Four optional, read-only WhatsApp Business label tools bring the total to 47. See [Tools](#tools) for the full reference and the [mode table](#tool-availability-by-mode).
+A hosted connection with all permissions has 47 tools. Business labels add four optional read-only tools. [Tool availability by mode](#tool-availability-by-mode)
 
 > **Data sharing.** Anything read through MCP tools or resources (messages, contact names, media bytes) is available to your client, which may pass it to its model provider. Transcription uploads audio to the endpoint you configure.
 
@@ -123,14 +123,14 @@ Ask the client to call `get_status` (connection and pairing state) and `list_cha
 
 ## Tools
 
-The default set is 43 tools grouped by purpose. `-enable-labels` adds four read-only WhatsApp Business tools (47 total).
-
 ### Tool availability by mode
 
 | Mode | Labels off | Labels on |
-|---|---|---|
-| Full access (`serve`) | 43 tools | 47 tools |
-| Read-only (`serve -read-only`) | 15 tools | 19 tools |
+|---|---:|---:|
+| Hosted with all permissions | 47 | 51 |
+| Hosted with read permission | 17 | 21 |
+| Local key with all tools | 45 | 49 |
+| Local key in read-only mode | 15 | 19 |
 
 - `transcribe_audio` is always advertised in full-access mode but works only when `WHATSAPP_MCP_TRANSCRIBE_URL` is set. It is excluded from read-only mode because it uploads private audio to another service.
 - Read-only mode removes tools that send messages, mark messages read, publish presence or change the WhatsApp account. It still allows network access, media downloads, history requests, writes to the local cache (including label syncs), MCP resources, and the operator pairing and reset actions on `/pair`. It is not a network-isolation mode: cached queries work while disconnected, but live operations need a connection. A client can still read any cached data.
@@ -139,13 +139,14 @@ The default set is 43 tools grouped by purpose. `-enable-labels` adds four read-
 
 | Tool | Purpose |
 |---|---|
+| `search` and `fetch` | Hosted research tools that find and read archived messages with stable, owner-only citations |
 | `search_contacts` | Substring search across cached contact names and phone numbers |
 | `list_messages` | Query + filter messages; returns formatted text with context windows |
 | `list_chats` | List chats with last-message preview; sort by activity or name |
 | `get_chat` | Chat metadata by JID |
-| `get_message_context` | Before/after window around a specific message |
+| `get_message_context` | Messages around a specific message. Supply `chat_jid` when the same message ID occurs in more than one chat |
 | `get_poll_results` | Return the tally for a poll we have cached (includes 0-vote options) |
-| `download_media` | Download persisted media to a local path |
+| `download_media` | Return decrypted media inline or by one-time download link |
 | `request_sync` | Ask WhatsApp to backfill history for a chat that already has at least one cached message |
 | `transcribe_audio` | Download an audio message, upload it to the configured speech-to-text service, and cache the transcript (opt-in; excluded from read-only mode) |
 
@@ -155,6 +156,8 @@ For `recipient`, use phone digits without a leading `+`, spaces or punctuation, 
 
 | Tool | Purpose |
 |---|---|
+| `confirm_send` | Confirm a reviewed draft from this connection before it expires |
+| `create_upload_link` | Create a one-time page to attach a file from your device |
 | `send_message` | Send a text message to a phone number or JID |
 | `send_file` | Send image/video/document/raw audio with optional caption; `view_once: bool` marks image/video/audio submessages as view-once (ignored for documents) |
 | `send_audio_message` | Send a voice note (auto-converts via ffmpeg if not `.ogg` Opus); supports `view_once: bool` |
@@ -224,7 +227,7 @@ Enable with `serve -enable-labels` or `WHATSAPP_MCP_LABELS=1`. Label tools are n
 |---|---|
 | `is_on_whatsapp` | Batch-check which phone numbers are registered on WhatsApp |
 | `get_status` | Report daemon and connection status, and which account it's paired as |
-| `pairing_status` | Report the device-pairing state as a structured `setup_state` envelope (`ready` / `awaiting_qr` + `qr_payload` or `expired` / `error`) for programmatic supervisors that surface the linking QR |
+| `pairing_status` | Report the device pairing state. Hosted sign-ins use the owner’s `/pair` page for the QR code. The local key mode can return the QR payload directly |
 
 ### Deferred
 
@@ -262,7 +265,7 @@ Environment only:
 - `WHATSAPP_MCP_TRANSCRIBE_URL`: enables `transcribe_audio`. Base URL of a speech-to-text service that implements the OpenAI-compatible `POST /v1/audio/transcriptions` (a local whisper.cpp or faster-whisper server, LocalAI, or a hosted API). Unset = feature off. Loopback HTTP endpoints are allowed; non-loopback endpoints require HTTPS and explicit opt-in with `WHATSAPP_MCP_TRANSCRIBE_ALLOW_REMOTE=1`. That opt-in sends audio to another service, so use a trusted endpoint. HTTP redirects are refused; configure the final transcription endpoint directly.
   Optional: `WHATSAPP_MCP_TRANSCRIBE_MODEL`, `WHATSAPP_MCP_TRANSCRIBE_LANGUAGE` (ISO 639-1; empty = autodetect), `WHATSAPP_MCP_TRANSCRIBE_TOKEN` (bearer token for the service), `WHATSAPP_MCP_TRANSCRIBE_MAX_SECONDS` (default 600). Ogg/Opus duration is checked before upload; malformed streams are rejected. Other formats rely on the service's duration limit. Transcripts are third-party content and are cached in `messages.db`. The first transcript is reused; changing the model or language affects only messages without a cached transcript.
 
-For remote clients (Claude on the web or phone), host the server in passphrase sign-in mode. There is no shared bearer token: each client signs in through OAuth and the owner approves it with their passphrase. See [docs/hosting.md](docs/hosting.md).
+For remote clients such as ChatGPT and Claude, host the server in passphrase sign-in mode. There is no shared bearer token: each client signs in through OAuth and the owner approves it with their passphrase. See [docs/hosting.md](docs/hosting.md).
 
 For an archive or summarisation client, start with the explicit read-only mode:
 
@@ -299,6 +302,8 @@ A file lock on `store/.lock` allows one `serve` or `login` process per store. Mu
 For monitoring, `GET /healthz` returns `200 {"ok":true}` while the HTTP server is alive. `GET /readyz` returns `200 {"ready":true}` only while paired and connected, or `503 {"ready":false}` otherwise (not paired, or disconnected). Both are unauthenticated, even with `-allow-remote`, and expose no account identifiers; restrict network access to the listener as needed. `get_status` also reports `connection_state` and `connection_state_since`, including logged-out, replaced, outdated, temporary-ban and connection-failure events. A keepalive timeout is reported until restored or disconnected; it does not itself mean the socket has closed. In passphrase sign-in mode both probes return `200` whenever the process is up: a locked instance is the normal resting state.
 
 Run `whatsapp-mcp healthcheck` to probe readiness without curl. It uses `WHATSAPP_MCP_ADDR` or `127.0.0.1:8765`; `healthcheck -addr 127.0.0.1:PORT` overrides either. Only loopback and wildcard bind addresses are accepted, and wildcard addresses are probed via loopback. Exit status is 0 for ready, 1 for unavailable or unready, and 2 for invalid arguments. It never opens the store or sends a bearer token.
+
+For the launchd and systemd templates, initialise a passphrase vault once in the foreground. Set `SETUP_TOKEN`, use the service’s store directory and loopback address, then claim the vault at `/setup`. Stop the foreground process before starting the service. The templates can reopen that vault without the setup token.
 
 | Option | How |
 |---|---|

@@ -79,14 +79,9 @@ func (s *Store) ListMessagesPage(ctx context.Context, params ListMessagesParams)
 		args = append(args, params.ChatJID)
 	}
 	if params.Query != "" {
-		if match := searchMatchExpr(params.Query); match != "" {
-			whereClauses = append(whereClauses, "messages.rowid IN (SELECT docid FROM messages_fts WHERE messages_fts MATCH ?)")
-			args = append(args, match)
-		} else {
-			// Not answerable from the word index (see searchMatchExpr).
-			whereClauses = append(whereClauses, "LOWER(messages.content) LIKE LOWER(?)")
-			args = append(args, "%"+params.Query+"%")
-		}
+		predicate, term := messageSearchPredicate(params.Query)
+		whereClauses = append(whereClauses, predicate)
+		args = append(args, term)
 	}
 	if params.Cursor != "" {
 		ts, id, chatJID, err := decodeCursor(params.Cursor)
@@ -110,7 +105,7 @@ func (s *Store) ListMessagesPage(ctx context.Context, params ListMessagesParams)
 	}
 	// Order on the normalised timestamp key with the message ID as a
 	// deterministic tie-breaker; fetch one extra row to detect a next page.
-	b.WriteString(" ORDER BY " + listMessageTimeKey + " DESC, messages.id DESC, messages.chat_jid DESC")
+	b.WriteString(" ORDER BY " + listMessageOrder)
 	b.WriteString(" LIMIT ?")
 	args = append(args, limit+1)
 	if params.Cursor == "" {
@@ -161,7 +156,7 @@ func (s *Store) ListMessagesPage(ctx context.Context, params ListMessagesParams)
 	// Expand context: before messages (DESC), the match, after messages (ASC).
 	var expanded []Message
 	for _, m := range result {
-		c, err := s.GetMessageContext(ctx, m.ID, before, after)
+		c, err := s.GetMessageContextInChat(ctx, m.ID, m.ChatJID, before, after)
 		if err != nil {
 			return nil, "", err
 		}
@@ -305,53 +300,44 @@ func (s *Store) SearchContacts(ctx context.Context, query string) ([]Contact, er
 // GetMessageContext returns the target message together with before/after
 // windows from the same chat.
 func (s *Store) GetMessageContext(ctx context.Context, messageID string, before, after int) (*MessageContext, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type,
-		       messages.edited_at IS NOT NULL, messages.revoked_at
-		FROM messages
-		JOIN chats ON messages.chat_jid = chats.jid
-		WHERE messages.id = ?`, messageID)
+	return s.GetMessageContextInChat(ctx, messageID, "", before, after)
+}
 
-	var (
-		ts        time.Time
-		sender    string
-		chatName  sql.NullString
-		content   sql.NullString
-		isFromMe  bool
-		chatJID   string
-		id        string
-		msgChat   string
-		mediaType sql.NullString
-		edited    bool
-		revokedAt sql.NullTime
-	)
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &msgChat, &mediaType, &edited, &revokedAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("message with ID %s not found", messageID)
-		}
+// GetMessageContextInChat uses the composite message key when the chat is known.
+func (s *Store) GetMessageContextInChat(ctx context.Context, messageID, chatJID string, before, after int) (*MessageContext, error) {
+	q := "SELECT " + listMessageColumns + " FROM messages JOIN chats ON messages.chat_jid=chats.jid WHERE messages.id=?"
+	args := []any{messageID}
+	if chatJID != "" {
+		q += " AND messages.chat_jid=?"
+		args = append(args, chatJID)
+	}
+	rows, err := s.db.QueryContext(ctx, q+" LIMIT 2", args...)
+	if err != nil {
 		return nil, fmt.Errorf("get message context: %w", err)
 	}
-
-	target := Message{
-		ID:        id,
-		ChatJID:   chatJID,
-		Sender:    sender,
-		Content:   content.String,
-		Timestamp: ts,
-		IsFromMe:  isFromMe,
-		MediaType: mediaType.String,
-		ChatName:  chatName.String,
-		Edited:    edited,
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("message with ID %s not found", messageID)
 	}
-	setRevoked(&target, revokedAt)
-	target.IsGroup = strings.HasSuffix(target.ChatJID, "@g.us")
-	target.SenderPhone = s.resolveSenderPhone(target.Sender)
-
-	beforeMsgs, err := s.queryContextWindow(ctx, msgChat, ts, before, false)
+	target, err := s.scanListMessageRow(rows)
 	if err != nil {
 		return nil, err
 	}
-	afterMsgs, err := s.queryContextWindow(ctx, msgChat, ts, after, true)
+	if rows.Next() {
+		return nil, errors.New("message ID occurs in multiple chats; supply chat_jid")
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	beforeMsgs, err := s.queryContextWindow(ctx, target, before, false)
+	if err != nil {
+		return nil, err
+	}
+	afterMsgs, err := s.queryContextWindow(ctx, target, after, true)
 	if err != nil {
 		return nil, err
 	}
@@ -404,8 +390,8 @@ func (s *Store) chatNameByJID(ctx context.Context, jid string) string {
 }
 
 // queryContextWindow fetches `limit` messages in chat either strictly before
-// (ascending=false) or strictly after (ascending=true) the anchor timestamp.
-func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor time.Time, limit int, ascending bool) ([]Message, error) {
+// (ascending=false) or after (ascending=true) the target in timestamp and ID order.
+func (s *Store) queryContextWindow(ctx context.Context, target Message, limit int, ascending bool) ([]Message, error) {
 	op := "<"
 	order := "DESC"
 	if ascending {
@@ -416,11 +402,11 @@ func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor t
 		SELECT `+listMessageColumns+`
 		FROM messages
 		JOIN chats ON messages.chat_jid = chats.jid
-		WHERE messages.chat_jid = ? AND messages.timestamp %s ?
-		ORDER BY messages.timestamp %s, messages.id %s
-		LIMIT ?`, op, order, order)
+		WHERE messages.chat_jid = ? AND (%s, messages.id) %s (?, ?)
+		ORDER BY %s %s, messages.id %s
+		LIMIT ?`, listMessageTimeKey, op, listMessageTimeKey, order, order)
 
-	rows, err := s.db.QueryContext(ctx, q, chatJID, anchor, limit)
+	rows, err := s.db.QueryContext(ctx, q, target.ChatJID, utcTimestampText(target.Timestamp)[:29], target.ID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("context window: %w", err)
 	}
@@ -574,6 +560,8 @@ func setRevoked(m *Message, revokedAt sql.NullTime) {
 		m.Revoked, m.RevokedAt = true, &at
 	}
 }
+
+const listMessageOrder = listMessageTimeKey + " DESC, messages.id DESC, messages.chat_jid DESC"
 
 // listMessageTimeKey normalises a stored timestamp into a fixed-width UTC
 // nanosecond key. Canonical rows already carry nine fractional digits; legacy

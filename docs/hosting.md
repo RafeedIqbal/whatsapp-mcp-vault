@@ -21,6 +21,8 @@ The Blueprint was checked with `render blueprints validate`. It has not been dep
 
 ## Connect ChatGPT and Claude to one account
 
+If your current archive uses `WHATSAPP_MCP_VAULT_KEY`, keep that directory and key together. Create the hosted vault on a separate empty volume and link it once. Importing a key-in-environment archive into a passphrase vault is still unsupported.
+
 1. Open the instance’s HTTPS `/setup` page with its one-time setup code. Choose a passphrase, save the recovery code, and use WhatsApp’s **Linked devices** screen to scan the owner pairing page once.
 2. Open **Connected apps** at `/setup` and copy the full URL ending in `/mcp`.
 3. In ChatGPT on the web, open **Plugins**, select **Add custom MCP server** and enter that URL. Choose **OAuth** and the published client identity (CIMD). Install the resulting private plugin. Workspace permissions govern who can add an MCP server. [OpenAI custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server)
@@ -28,6 +30,12 @@ The Blueprint was checked with `render blueprints validate`. It has not been dep
 5. Approve each connection with the vault passphrase. Reading is included. Tick sending or account management for each app individually. Call `get_status` and `list_chats` from both to check the shared account and archive.
 
 The server validates the published client document at an exact HTTPS address, PKCE S256, the callback, the issuer and the MCP resource. ChatGPT normally returns to `https://chatgpt.com/connector_platform_oauth_redirect`. If the ChatGPT management screen shows a connection-specific callback, add its exact HTTPS URL to `OAUTH_REDIRECT_ALLOWLIST` and choose dynamic registration. [OpenAI authentication guide](https://developers.openai.com/plugins/build/auth)
+
+## Search and cite messages
+
+Ask either assistant to “find the WhatsApp messages about the workshop and cite them”. With read permission, `search` returns the 20 most recent matches and `fetch` opens a selected message. Both operate on the encrypted cache, including while the phone is offline. Full-text queries match word prefixes in any order. Emoji and scripts without word boundaries use literal matching. [OpenAI research tool format](https://developers.openai.com/api/docs/mcp)
+
+Each result links to `/sources/<opaque-id>` on this instance. The link takes you through owner sign-in and back to the message. Both assistants get the same link across restarts. If WhatsApp reports an edit or deletion for everyone, the result reflects that status. The archive retains the last cached text of deleted messages and marks it with the deletion time.
 
 ## The owner page
 
@@ -83,5 +91,7 @@ What this does not protect against:
 Anything that runs the Dockerfile with a persistent volume at `/home/app/store` and terminates HTTPS in front of it will do. Set `WHATSAPP_MCP_ADDR`, `WHATSAPP_MCP_ALLOW_REMOTE=1`, `PUBLIC_URL` and `SETUP_TOKEN`. The container starts as root only to take ownership of the mounted volume, then drops to an unprivileged user before the server starts.
 
 ## Updating
+
+The first unlock on this version gives existing messages persistent citation IDs inside `messages.db`. Back up the volume with the daemon stopped before upgrading. Rolling back to an older binary that only supports archive schema 1 requires restoring the matching backup.
 
 WhatsApp changes its protocol regularly and stale clients stop connecting. The CI workflow probes for a newer `whatsmeow` every week. Deploys are manual in the Blueprint (`autoDeployTrigger: "off"`) so an update can be tried on one instance before the rest.

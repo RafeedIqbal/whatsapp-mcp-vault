@@ -250,7 +250,7 @@ func TestReadOnlyServer_RejectsMutationTools(t *testing.T) {
 }
 
 func TestEveryToolHasReadOnlyClassification(t *testing.T) {
-	tools := NewServer(nil, nil, true).MCP().ListTools()
+	tools := NewServerWithAccess(nil, nil, true, Access{Send: true, Manage: true}, "https://wa.example.test").MCP().ListTools()
 	for name := range tools {
 		if _, ok := readOnlyToolAccess[name]; !ok {
 			t.Errorf("tool %q has no reviewed access classification", name)
