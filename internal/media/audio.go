@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"time"
 )
 
 // AnalyzeOggOpus returns the unclamped duration rounded up to seconds and a
@@ -242,8 +243,11 @@ func ConvertToOpusOggBytes(ctx context.Context, input []byte) ([]byte, error) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return nil, errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-protocol_whitelist", "pipe",
 		"-i", "pipe:0",
 		"-vn",
 		"-c:a", "libopus",
@@ -255,16 +259,31 @@ func ConvertToOpusOggBytes(ctx context.Context, input []byte) ([]byte, error) {
 	)
 	cmd.Env = minimalEnv()
 	cmd.Stdin = bytes.NewReader(input)
-	var stdout, stderr bytes.Buffer
+	var stdout bytes.Buffer
+	var stderr diagnosticPrefix
 	cmd.Stdout = &limitedWriter{w: &stdout, left: maxConvertedAudioBytes}
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(stderr.String()))
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("audio conversion stopped: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(string(stderr)))
 	}
 	if stdout.Len() == 0 {
 		return nil, errors.New("ffmpeg produced no audio")
 	}
 	return stdout.Bytes(), nil
+}
+
+// diagnosticPrefix keeps draining stderr after collecting enough context for an error.
+type diagnosticPrefix []byte
+
+const maxDiagnosticBytes = 4096
+
+func (d *diagnosticPrefix) Write(p []byte) (int, error) {
+	n := min(len(p), maxDiagnosticBytes-len(*d))
+	*d = append(*d, p[:n]...)
+	return len(p), nil
 }
 
 // limitedWriter fails once more than its budget has been written.
