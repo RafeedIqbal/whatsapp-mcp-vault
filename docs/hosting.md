@@ -19,25 +19,21 @@ This server is built to be hosted as **one private instance per person**: each p
 
 The Blueprint was checked with `render blueprints validate`. It has not been deployed by the authors of this fork, so treat the first deploy as a test.
 
-## What each person does
+## Connect ChatGPT and Claude to one account
 
-1. Open `https://<their-service>/setup`, enter the setup code, and choose a passphrase of at least 12 characters.
-2. Save the recovery code shown next. It is displayed once. Without the passphrase or the recovery code the archive cannot be opened by anyone.
-3. Follow the link to the pairing page and scan the QR code from WhatsApp (Settings → Linked Devices → Link a Device). Keep the phone online for a few minutes while history arrives.
-4. In Claude, add `https://<their-service>/mcp` as a custom connector. Claude sends them to a page on their instance, where they enter the passphrase and tick what Claude may do: read (always), send messages, manage groups and settings.
+1. Open the instance’s HTTPS `/setup` page with its one-time setup code. Choose a passphrase, save the recovery code, and use WhatsApp’s **Linked devices** screen to scan the owner pairing page once.
+2. Open **Connected apps** at `/setup` and copy the full URL ending in `/mcp`.
+3. In ChatGPT on the web, open **Plugins**, select **Add custom MCP server** and enter that URL. Choose **OAuth** and the published client identity (CIMD). Install the resulting private plugin. Workspace permissions govern who can add an MCP server. [OpenAI custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server)
+4. In Claude, open **Customize → Connectors → Add custom connector**. Enter the same URL, choose **Sign in now** and **Use Claude’s published identity**. Both clients can also use automatic dynamic registration. [Claude connector guide](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+5. Approve each connection with the vault passphrase. Reading is included. Tick sending or account management for each app individually. Call `get_status` and `list_chats` from both to check the shared account and archive.
 
-To link or re-link WhatsApp later, open `/setup` and sign in with the passphrase.
+The server validates the published client document at an exact HTTPS address, PKCE S256, the callback, the issuer and the MCP resource. ChatGPT normally returns to `https://chatgpt.com/connector_platform_oauth_redirect`. If the ChatGPT management screen shows a connection-specific callback, add its exact HTTPS URL to `OAUTH_REDIRECT_ALLOWLIST` and choose dynamic registration. [OpenAI authentication guide](https://developers.openai.com/plugins/build/auth)
 
 ## The owner page
 
-Signing in at `/setup` (with the passphrase or the recovery code) opens a page where the owner can:
+Open `/setup` to see the app names and their granted permissions. **Disconnect** ends one authorisation, including its refresh tokens and pending transfers. **Sign all apps out** ends every connection. To change a grant, disconnect it and approve it again with the desired permissions. **Lock now** closes the WhatsApp runtime and clears pending work. An authorised app can reopen it on its next request.
 
-- **Link or re-link WhatsApp.**
-- **Change the passphrase.** Apps that are already connected stay connected.
-- **Sign all apps out.** Deletes every sign-in; each app has to be approved again. Use it if a device is lost.
-- **Lock now.** Disconnects from WhatsApp and discards the key from memory until the next sign-in.
-
-If the passphrase is forgotten, "Forgot your passphrase?" on the sign-in page takes the recovery code and sets a new passphrase. The archive and connected apps are kept. If both the passphrase and the recovery code are lost, the archive cannot be opened by anyone: delete the disk and set the instance up again.
+Use the recovery code on the sign-in page to set a new passphrase. The archive and connected apps survive a passphrase change.
 
 ## Settings
 
@@ -49,8 +45,8 @@ If the passphrase is forgotten, "Forgot your passphrase?" on the sign-in page ta
 | `SETUP_TOKEN` | One-time code for `/setup`. Empty means nobody can set the instance up | none |
 | `IDLE_LOCK` | How long the instance stays unlocked without use, as a duration (`15m`, `90s`) | `15m` |
 | `ALLOW_NEW_RECIPIENTS` | Allow sending to chats that have no history | `false` |
-| `SEND_CONFIRM` | `new_recipients`, `always` or `off`: which sends are held as a draft until confirmed | `new_recipients` |
-| `OAUTH_REDIRECT_ALLOWLIST` | Extra exact https sign-in callbacks, comma-separated. Claude's are built in | none |
+| `SEND_CONFIRM` | `new_recipients`, `always` or `off`: which sends are held as a draft until confirmed | `always` for hosted instances |
+| `OAUTH_REDIRECT_ALLOWLIST` | Extra exact https sign-in callbacks, comma-separated. ChatGPT and Claude callbacks are built in | none |
 | `WHATSAPP_MCP_READ_ONLY` | `1` removes every tool that sends or changes anything, whatever a sign-in was granted | off |
 
 Do **not** set `WHATSAPP_MCP_VAULT_KEY` on a hosted instance. That variable selects a local development mode that keeps the data key in the environment, and the server refuses to combine it with remote connections.
@@ -71,7 +67,7 @@ What this does not protect against:
 ## Send safety
 
 - A sign-in that was only granted reading is not offered any tool that sends or changes anything.
-- Sending to a chat with no history is refused unless `ALLOW_NEW_RECIPIENTS=true`. With it on, such sends are held as a draft and need a second, explicit `confirm_send` (`SEND_CONFIRM=new_recipients`); `SEND_CONFIRM=always` holds every send.
+- Sending to a chat with no history is refused unless `ALLOW_NEW_RECIPIENTS=true`. Hosted instances default to `SEND_CONFIRM=always`. The assistant displays the recipient and content, asks for approval and uses `confirm_send` on the same connection. This includes replies, files, polls, votes, reactions and group additions that may send private invitations. Manage-only connections can add participants and report invitations as required.
 - Sends are rate limited on the server (at least 45 seconds apart, 30 an hour; stricter to people who have never written to you). Locking and unlocking does not reset the limit.
 - Message text handed to the model is labelled as written by other people and not to be followed as instructions. The confirm step guards against mistakes; it is not a barrier against a hijacked model, which is what the permissions, the new-recipient block and the rate limit are for.
 

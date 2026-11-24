@@ -213,14 +213,17 @@ func (s *Store) IssueCode(ctx context.Context, g CodeGrant, key vault.Key) (stri
 // instance key. A code works once; any second use, and any use after it has
 // expired, fails with ErrInvalidGrant.
 func (s *Store) RedeemCode(ctx context.Context, code string) (CodeGrant, vault.Key, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.redeemCodeLocked(ctx, code)
+}
+
+func (s *Store) redeemCodeLocked(ctx context.Context, code string) (CodeGrant, vault.Key, error) {
 	raw, ok := parseSecret(code, codePrefix)
 	if !ok {
 		return CodeGrant{}, vault.Key{}, ErrInvalidGrant
 	}
 	id := vault.SecretID(raw, purposeCode)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var g CodeGrant
 	var wrapped []byte
 	var expires int64
@@ -269,7 +272,23 @@ type TokenPair struct {
 func (s *Store) IssueTokens(ctx context.Context, g Grant, key vault.Key) (TokenPair, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.issueLocked(ctx, s.db, g, key)
+	return s.issuePairLocked(ctx, g, key)
+}
+
+func (s *Store) issuePairLocked(ctx context.Context, g Grant, key vault.Key) (TokenPair, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TokenPair{}, err
+	}
+	defer tx.Rollback()
+	pair, err := s.issueLocked(ctx, tx, g, key)
+	if err != nil {
+		return TokenPair{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TokenPair{}, err
+	}
+	return pair, nil
 }
 
 // execer is satisfied by *sql.DB and *sql.Tx.
@@ -434,13 +453,15 @@ func (s *Store) Refresh(ctx context.Context, refreshToken, clientID string) (Tok
 func (s *Store) RevokeAll(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_tokens`); err != nil {
-		return fmt.Errorf("revoke tokens: %w", err)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_codes`); err != nil {
-		return fmt.Errorf("discard sign-in codes: %w", err)
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM oauth_tokens; DELETE FROM oauth_codes"); err != nil {
+		return err
 	}
-	return nil
+	return tx.Commit()
 }
 
 // PurgeExpired deletes codes and tokens that can no longer be used.

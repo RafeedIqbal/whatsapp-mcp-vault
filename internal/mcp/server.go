@@ -5,9 +5,10 @@ package mcp
 import (
 	"net/http"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-
 	"github.com/sealjay/mcp-whatsapp/internal/client"
+	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 )
 
 // pairingCache is the minimal pairing-state surface pairing_status needs.
@@ -25,12 +26,13 @@ type Server struct {
 	client        *client.Client
 	mcp           *server.MCPServer
 	cache         pairingCache
+	access        *Access // present on the hosted OAuth endpoint
 	readOnly      bool
 	labelsEnabled bool
 	files         *Files // nil: no link fetching, upload page or download links
 
 	confirm        ConfirmMode
-	drafts         *draftStore
+	drafts         *DraftStore
 	confirmable    map[string]bool
 	isNewRecipient func(recipient string) bool
 }
@@ -43,37 +45,28 @@ type Server struct {
 var Version = "dev"
 
 func NewServer(c *client.Client, cache pairingCache, labelsEnabled bool) *Server {
-	return newServer(c, cache, false, labelsEnabled)
+	return newServer(c, cache, false, labelsEnabled, nil)
 }
 
 // NewReadOnlyServer excludes tools that can mutate the WhatsApp account.
 func NewReadOnlyServer(c *client.Client, cache pairingCache, labelsEnabled bool) *Server {
-	return newServer(c, cache, true, labelsEnabled)
+	return newServer(c, cache, true, labelsEnabled, nil)
 }
 
 // NewServerWithAccess exposes only the tools a signed-in client was granted:
 // read-only tools always, send and manage tools only with those grants.
 // Calling a tool outside the grant fails as an unknown tool.
 func NewServerWithAccess(c *client.Client, cache pairingCache, labelsEnabled bool, access Access) *Server {
-	if !access.Send && !access.Manage {
-		return newServer(c, cache, true, labelsEnabled)
-	}
-	s := newServer(c, cache, false, labelsEnabled)
-	for name := range s.mcp.ListTools() {
-		if !access.allows(name) {
-			s.mcp.DeleteTools(name)
-		}
-	}
-	return s
+	return newServer(c, cache, !access.Send && !access.Manage, labelsEnabled, &access)
 }
 
-func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool) *Server {
+func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool, access *Access) *Server {
 	instructions := baseInstructions
 	if readOnly {
 		instructions += " This server is in read-only mode: tools cannot send messages or mutate the WhatsApp account. Downloads and history requests can still retrieve data and write the local cache. An explicit media download may ask your own phone to re-upload an expired attachment; it never notifies the sender or chat. Pairing remains an operator action through /pair."
 	}
-	s := &Server{client: c, cache: cache, readOnly: readOnly, labelsEnabled: labelsEnabled,
-		drafts: newDraftStore(), confirmable: defaultConfirmable()}
+	s := &Server{access: access, client: c, cache: cache, readOnly: readOnly, labelsEnabled: labelsEnabled,
+		drafts: NewDraftStore(), confirmable: defaultConfirmable()}
 	s.isNewRecipient = func(recipient string) bool { return s.client != nil && s.client.RecipientIsNew(recipient) }
 	s.mcp = server.NewMCPServer(
 		"whatsapp",
@@ -83,13 +76,23 @@ func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled boo
 		server.WithToolHandlerMiddleware(s.confirmMiddleware),
 	)
 	s.registerTools()
-	if readOnly {
-		for name := range s.mcp.ListTools() {
-			if !readOnlyToolAccess[name] {
-				s.mcp.DeleteTools(name)
-			}
+	var tools []server.ServerTool
+	for name, tool := range s.mcp.ListTools() {
+		if readOnly && !readOnlyToolAccess[name] || access != nil && !access.allows(name) {
+			continue
 		}
+		if access != nil {
+			scopes := []string{oauth.ScopeRead}
+			if manageToolAccess[name] {
+				scopes = append(scopes, oauth.ScopeManage)
+			} else if !readOnlyToolAccess[name] {
+				scopes = append(scopes, oauth.ScopeSend)
+			}
+			tool.Tool.Meta = &mcp.Meta{AdditionalFields: map[string]any{"securitySchemes": []map[string]any{{"type": "oauth2", "scopes": scopes}}}}
+		}
+		tools = append(tools, *tool)
 	}
+	s.mcp.SetTools(tools...)
 	s.registerResources()
 	return s
 }

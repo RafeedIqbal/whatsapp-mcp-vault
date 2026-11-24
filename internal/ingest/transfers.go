@@ -32,11 +32,13 @@ const maxOpenUploads = 32
 // unguessable one-time id, works once, expires after a few minutes, and the
 // total held is capped. Nothing is ever written to disk.
 type Transfers struct {
-	baseURL  string
-	maxItem  int64
-	maxTotal int64
-	ttl      time.Duration
-	now      func() time.Time
+	// ConnectionActive checks hosted browser links against their originating grant.
+	ConnectionActive func(context.Context, string) bool
+	baseURL          string
+	maxItem          int64
+	maxTotal         int64
+	ttl              time.Duration
+	now              func() time.Time
 
 	mu    sync.Mutex
 	items map[string]*transfer
@@ -44,6 +46,7 @@ type Transfers struct {
 }
 
 type transfer struct {
+	family  string
 	upload  bool
 	filled  bool
 	blob    Blob
@@ -103,7 +106,7 @@ func (t *Transfers) Run(ctx context.Context) {
 
 // NewUploadSlot creates an empty upload and returns its id and the page
 // address the person opens to choose a file.
-func (t *Transfers) NewUploadSlot() (id, link string, err error) {
+func (t *Transfers) NewUploadSlot(family string) (id, link string, err error) {
 	id, err = newID()
 	if err != nil {
 		return "", "", err
@@ -120,7 +123,7 @@ func (t *Transfers) NewUploadSlot() (id, link string, err error) {
 	if open >= maxOpenUploads {
 		return "", "", ErrBusy
 	}
-	t.items[id] = &transfer{upload: true, expires: t.now().Add(t.ttl)}
+	t.items[id] = &transfer{family: family, upload: true, expires: t.now().Add(t.ttl)}
 	return id, t.baseURL + "/upload/" + id, nil
 }
 
@@ -158,12 +161,12 @@ func (t *Transfers) uploadOpen(id string) bool {
 }
 
 // TakeUpload returns the uploaded file and forgets it.
-func (t *Transfers) TakeUpload(id string) (Blob, error) {
+func (t *Transfers) TakeUpload(family, id string) (Blob, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.expireLocked()
 	it, ok := t.items[id]
-	if !ok || !it.upload {
+	if !ok || !it.upload || it.family != family {
 		return Blob{}, ErrNoSuchTransfer
 	}
 	if !it.filled {
@@ -175,7 +178,17 @@ func (t *Transfers) TakeUpload(id string) (Blob, error) {
 }
 
 // OfferDownload holds a file for one download and returns its id and link.
-func (t *Transfers) OfferDownload(b Blob) (id, link string, err error) {
+func (t *Transfers) OfferDownload(family string, b Blob) (id, link string, err error) {
+	return t.hold(family, b, false)
+}
+
+// StageUpload holds immutable attachment bytes for a confirmed send.
+func (t *Transfers) StageUpload(family string, b Blob) (string, error) {
+	id, _, err := t.hold(family, b, true)
+	return id, err
+}
+
+func (t *Transfers) hold(family string, b Blob, upload bool) (id, link string, err error) {
 	if int64(len(b.Data)) > t.maxItem {
 		return "", "", ErrTooLarge
 	}
@@ -190,7 +203,7 @@ func (t *Transfers) OfferDownload(b Blob) (id, link string, err error) {
 		return "", "", ErrBusy
 	}
 	b.Filename = SafeName(b.Filename)
-	t.items[id] = &transfer{blob: b, filled: true, expires: t.now().Add(t.ttl)}
+	t.items[id] = &transfer{family: family, upload: upload, blob: b, filled: true, expires: t.now().Add(t.ttl)}
 	t.total += int64(len(b.Data))
 	return id, t.baseURL + "/media/" + id, nil
 }
@@ -229,12 +242,39 @@ func (t *Transfers) Clear() {
 	t.total = 0
 }
 
+// Discard removes the outstanding transfers for one connection.
+func (t *Transfers) Discard(family string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, it := range t.items {
+		if it.family == family {
+			t.total -= int64(len(it.blob.Data))
+			delete(t.items, id)
+		}
+	}
+}
+
+func (t *Transfers) withActiveGrant(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if t.ConnectionActive != nil {
+			t.mu.Lock()
+			it := t.items[r.PathValue("id")]
+			t.mu.Unlock()
+			if it == nil || !t.ConnectionActive(r.Context(), it.family) {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 // Mount serves the upload page and the download link on mux. Neither needs a
 // sign-in: the unguessable one-time id in the address is the permission.
 func (t *Transfers) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("GET /upload/{id}", t.handleUploadPage)
-	mux.HandleFunc("POST /upload/{id}", t.handleUpload)
-	mux.HandleFunc("GET /media/{id}", t.handleDownload)
+	mux.HandleFunc("GET /upload/{id}", t.withActiveGrant(t.handleUploadPage))
+	mux.HandleFunc("POST /upload/{id}", t.withActiveGrant(t.handleUpload))
+	mux.HandleFunc("GET /media/{id}", t.withActiveGrant(t.handleDownload))
 }
 
 func pageHeaders(w http.ResponseWriter) {

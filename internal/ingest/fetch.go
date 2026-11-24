@@ -94,6 +94,15 @@ func (f *Fetcher) allowed(ip net.IP, port string) bool {
 
 // Fetch downloads the file at rawURL.
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Blob, error) {
+	return f.fetch(ctx, rawURL, true)
+}
+
+// FetchExact reads a public HTTPS resource at its canonical URL.
+func (f *Fetcher) FetchExact(ctx context.Context, rawURL string) (Blob, error) {
+	return f.fetch(ctx, rawURL, false)
+}
+
+func (f *Fetcher) fetch(ctx context.Context, rawURL string, followRedirects bool) (Blob, error) {
 	u, err := checkFetchURL(rawURL)
 	if err != nil {
 		return Blob{}, err
@@ -126,6 +135,9 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Blob, error) {
 			DisableKeepAlives:     true,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !followRedirects {
+				return http.ErrUseLastResponse
+			}
 			if len(via) >= 3 {
 				return errors.New("ingest: too many redirects")
 			}

@@ -109,6 +109,7 @@ func idleLockFromEnv(getenv func(string) string) (time.Duration, error) {
 }
 
 type vaultServeOptions struct {
+	drafts        *mcpsrv.DraftStore
 	storeDir      string
 	addr          string
 	redactor      *security.Redactor
@@ -125,6 +126,7 @@ type vaultServeOptions struct {
 // instance is everything that exists only while unlocked: the stores, the
 // WhatsApp client and the tool servers.
 type instance struct {
+	drafts *mcpsrv.DraftStore
 	st     *store.Store
 	c      *client.Client
 	d      *daemon.Server
@@ -149,6 +151,9 @@ func (r *instance) Owner() http.Handler { return r.owner }
 func (r *instance) Close() error {
 	r.cancel()
 	r.d.Shutdown()
+	if r.drafts != nil {
+		r.drafts.Discard("")
+	}
 	if r.files != nil && r.files.Transfers != nil {
 		r.files.Transfers.Clear() // nothing decrypted stays in memory once locked
 	}
@@ -219,10 +224,13 @@ func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instan
 			return fail(fmt.Errorf("init pairing: %w", err))
 		}
 
-		rt := &instance{st: st, c: c, d: d, cancel: cancel, owner: d.Handler(), tools: map[mcpsrv.Access]http.Handler{}, files: o.files}
+		rt := &instance{drafts: o.drafts, st: st, c: c, d: d, cancel: cancel, owner: d.Handler(), tools: map[mcpsrv.Access]http.Handler{}, files: o.files}
 		for _, access := range []mcpsrv.Access{{}, {Send: true}, {Manage: true}, {Send: true, Manage: true}} {
 			tools := mcpsrv.NewServerWithAccess(c, d.Cache(), o.labelsEnabled, access)
 			tools.SetFiles(o.files)
+			if o.drafts != nil {
+				tools.SetDraftStore(o.drafts)
+			}
 			tools.SetSendConfirmation(o.policy.effectiveConfirm())
 			mux := http.NewServeMux()
 			tools.AttachHTTP(mux)
@@ -259,7 +267,7 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		return 2
 	}
 	o.files = newFiles(publicURL)
-	go o.files.Transfers.Run(ctx)
+	o.drafts = mcpsrv.NewDraftStore()
 	o.limiter = ratelimit.New(ratelimit.DefaultConfig())
 	if err := os.MkdirAll(o.storeDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "create store dir: %v\n", err)
@@ -277,6 +285,10 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		return 1
 	}
 
+	o.files.Transfers.ConnectionActive = tokens.ConnectionActive
+	go o.files.Transfers.Run(ctx)
+	go o.drafts.Run(ctx)
+
 	var extraRedirects []string
 	for _, u := range strings.Split(os.Getenv("OAUTH_REDIRECT_ALLOWLIST"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
@@ -288,11 +300,19 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 	signIn := oauth.NewServer(oauth.Config{Issuer: publicURL, Store: tokens, Unlock: meta.Unlock, ExtraRedirectURIs: extraRedirects})
 	sessions := session.New(buildRuntime(o), idle)
 	gw := gateway.New(gateway.Config[*instance]{
-		Meta:          meta,
-		OAuth:         signIn,
-		Sessions:      sessions,
-		SetupToken:    strings.TrimSpace(os.Getenv("SETUP_TOKEN")),
-		RevokeAll:     tokens.RevokeAll,
+		Meta:       meta,
+		OAuth:      signIn,
+		Sessions:   sessions,
+		SetupToken: strings.TrimSpace(os.Getenv("SETUP_TOKEN")),
+		Grants:     tokens,
+		Discard: func(family string) {
+			o.drafts.Discard(family)
+			if family == "" {
+				o.files.Transfers.Clear()
+			} else {
+				o.files.Transfers.Discard(family)
+			}
+		},
 		OwnerIdle:     idle,
 		SecureCookies: strings.HasPrefix(publicURL, "https://"),
 		Extra:         o.files.Transfers.Mount,

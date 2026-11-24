@@ -91,7 +91,7 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	}
 	defer lock.Release()
 
-	policy, err := sendPolicyFromEnv(os.Getenv)
+	policy, err := sendPolicyFromEnv(!envKeyMode, os.Getenv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 		return 2
@@ -166,7 +166,12 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	files := newFiles("http://" + addr)
 	go files.Transfers.Run(ctx)
 	mcpServer.SetFiles(files)
-	mcpServer.SetSendConfirmation(policy.effectiveConfirm())
+	if mode := policy.effectiveConfirm(); mode != mcpsrv.ConfirmOff {
+		drafts := mcpsrv.NewDraftStore()
+		go drafts.Run(ctx)
+		mcpServer.SetDraftStore(drafts)
+		mcpServer.SetSendConfirmation(mode)
+	}
 	d.SetMCPMount(func(mux *http.ServeMux) {
 		mcpServer.AttachHTTP(mux)
 		files.Transfers.Mount(mux)

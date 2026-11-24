@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/sealjay/mcp-whatsapp/internal/client"
 	"github.com/sealjay/mcp-whatsapp/internal/media"
+	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 )
 
 // registerSendTools wires outbound-message tools: send_message, send_file,
@@ -125,11 +125,11 @@ func (s *Server) registerCreateUploadLink() {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.mcp.AddTool(tool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if s.files == nil || s.files.Transfers == nil {
 			return mcp.NewToolResultError("this server has no upload page; send small files with data_base64 or give a public https link"), nil
 		}
-		id, link, err := s.files.Transfers.NewUploadSlot()
+		id, link, err := s.files.Transfers.NewUploadSlot(oauth.GrantFamily(ctx))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 )
 
 // ConfirmMode says which sends are held as a draft until confirm_send.
@@ -43,26 +45,29 @@ func defaultConfirmable() map[string]bool {
 		"send_poll":          true,
 		"send_contact_card":  true,
 		"send_reply":         true,
+		"send_reaction":      true,
+		"send_poll_vote":     true,
 	}
 }
 
 type draft struct {
+	family  string
 	req     mcp.CallToolRequest
 	next    server.ToolHandlerFunc
 	expires time.Time
 }
 
-type draftStore struct {
+type DraftStore struct {
 	mu    sync.Mutex
 	items map[string]draft
 	now   func() time.Time
 }
 
-func newDraftStore() *draftStore {
-	return &draftStore{items: map[string]draft{}, now: time.Now}
+func NewDraftStore() *DraftStore {
+	return &DraftStore{items: map[string]draft{}, now: time.Now}
 }
 
-func (d *draftStore) put(req mcp.CallToolRequest, next server.ToolHandlerFunc) (string, error) {
+func (d *DraftStore) put(family string, req mcp.CallToolRequest, next server.ToolHandlerFunc) (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", errors.New("could not create a draft")
@@ -71,24 +76,44 @@ func (d *draftStore) put(req mcp.CallToolRequest, next server.ToolHandlerFunc) (
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := d.now()
+	d.expireLocked(now)
+	if len(d.items) >= maxDrafts {
+		return "", errors.New("too many drafts are waiting to be confirmed; confirm or let some expire first")
+	}
+	d.items[id] = draft{family: family, req: req, next: next, expires: now.Add(draftTTL)}
+	return id, nil
+}
+
+func (d *DraftStore) expireLocked(now time.Time) {
 	for k, v := range d.items {
 		if !now.Before(v.expires) {
 			delete(d.items, k)
 		}
 	}
-	if len(d.items) >= maxDrafts {
-		return "", errors.New("too many drafts are waiting to be confirmed; confirm or let some expire first")
+}
+
+// Run releases expired drafts even when the only remaining traffic is reads.
+func (d *DraftStore) Run(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.mu.Lock()
+			d.expireLocked(d.now())
+			d.mu.Unlock()
+		}
 	}
-	d.items[id] = draft{req: req, next: next, expires: now.Add(draftTTL)}
-	return id, nil
 }
 
 // take returns a draft and forgets it: a draft can be confirmed once.
-func (d *draftStore) take(id string) (draft, bool) {
+func (d *DraftStore) take(family, id string) (draft, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	v, ok := d.items[id]
-	if !ok {
+	if !ok || v.family != family {
 		return draft{}, false
 	}
 	delete(d.items, id)
@@ -97,6 +122,19 @@ func (d *draftStore) take(id string) (draft, bool) {
 	}
 	return v, true
 }
+
+// Discard drops all drafts for a connection. An empty ID clears the vault.
+func (d *DraftStore) Discard(family string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, item := range d.items {
+		if family == "" || item.family == family {
+			delete(d.items, id)
+		}
+	}
+}
+
+func (s *Server) SetDraftStore(store *DraftStore) { s.drafts = store }
 
 // SetSendConfirmation chooses which sends are held for confirm_send.
 func (s *Server) SetSendConfirmation(m ConfirmMode) { s.confirm = m }
@@ -109,38 +147,75 @@ func (s *Server) confirmMiddleware(next server.ToolHandlerFunc) server.ToolHandl
 		if !s.needsConfirmation(ctx, req) {
 			return next(ctx, req)
 		}
-		id, err := s.drafts.put(req, next)
+		family := oauth.GrantFamily(ctx)
+		args := maps.Clone(req.GetArguments())
+		preview := maps.Clone(args)
+		if preview == nil {
+			preview = make(map[string]any)
+		}
+		var staged string
+		if req.Params.Name == "send_file" || req.Params.Name == "send_audio_message" {
+			if s.files == nil || s.files.Transfers == nil {
+				return mcp.NewToolResultError("Attachment confirmation requires the file service."), nil
+			}
+			if req.GetString("recipient", "") == "" {
+				return mcp.NewToolResultError("recipient is required"), nil
+			}
+			src := attachmentSource{URL: req.GetString("url", ""), UploadID: req.GetString("upload_id", ""), DataBase64: req.GetString("data_base64", ""), Filename: req.GetString("filename", "")}
+			blob, err := s.resolveAttachment(ctx, src)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			staged, err = s.files.Transfers.StageUpload(family, blob)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			for _, key := range []string{"data_base64", "url", "upload_id"} {
+				delete(args, key)
+				delete(preview, key)
+			}
+			args["upload_id"] = staged
+			preview["filename"] = blob.Filename
+			preview["size_bytes"] = len(blob.Data)
+		}
+		// Retain only the tool invocation. Transport headers can carry credentials.
+		var saved mcp.CallToolRequest
+		saved.Params.Name, saved.Params.Arguments = req.Params.Name, args
+		id, err := s.drafts.put(family, saved, next)
 		if err != nil {
+			if staged != "" {
+				_, _ = s.files.Transfers.TakeUpload(family, staged)
+			}
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		args := req.GetArguments()
-		preview := map[string]any{
-			"draft_id":           id,
-			"status":             "not sent",
-			"tool":               req.Params.Name,
-			"recipient":          firstNonNil(args["recipient"], args["chat_jid"]),
-			"expires_in_seconds": int(draftTTL.Seconds()),
-			"next_step":          "Nothing has been sent. Check the recipient and content with the user, then call confirm_send with this draft_id to send exactly this.",
-		}
-		for _, k := range []string{"message", "body", "caption", "question", "filename", "target_message_id"} {
-			if v, ok := args[k].(string); ok && v != "" {
-				preview[k] = truncate(v, 500)
-			}
-		}
-		for _, k := range []string{"url", "upload_id"} {
-			if v, ok := args[k].(string); ok && v != "" {
-				preview["attachment_from"] = k
-			}
-		}
-		if v, ok := args["data_base64"].(string); ok && v != "" {
-			preview["attachment_from"] = "data_base64"
-		}
+		preview["draft_id"] = id
+		preview["status"] = "not sent"
+		preview["tool"] = req.Params.Name
+		preview["expires_in_seconds"] = int(draftTTL.Seconds())
+		preview["next_step"] = "Show the recipient and outgoing content to the user. After they approve, call confirm_send with this draft_id."
 		return resultJSON(preview)
 	}
 }
 
 func (s *Server) needsConfirmation(ctx context.Context, req mcp.CallToolRequest) bool {
-	if s.confirm == ConfirmOff || ctx.Value(confirmedKey{}) != nil || !s.confirmable[req.Params.Name] {
+	if s.confirm == ConfirmOff || ctx.Value(confirmedKey{}) != nil {
+		return false
+	}
+	if req.Params.Name == "update_group_participants" {
+		if (s.access != nil && !s.access.Send) || req.GetString("action", "") != "add" || !req.GetBool("send_invite", true) {
+			return false
+		}
+		if s.confirm == ConfirmAlways {
+			return true
+		}
+		for _, to := range req.GetStringSlice("participants", nil) {
+			if s.isNewRecipient(to) {
+				return true
+			}
+		}
+		return false
+	}
+	if !s.confirmable[req.Params.Name] {
 		return false
 	}
 	if s.confirm == ConfirmAlways {
@@ -160,14 +235,6 @@ func firstNonNil(vals ...any) any {
 	return nil
 }
 
-func truncate(v string, n int) string {
-	r := []rune(v)
-	if len(r) <= n {
-		return v
-	}
-	return string(r[:n]) + "…"
-}
-
 type confirmSendArgs struct {
 	DraftID string `json:"draft_id"`
 }
@@ -185,7 +252,7 @@ func (s *Server) registerConfirmSend() {
 		if a.DraftID == "" {
 			return mcp.NewToolResultError("draft_id is required"), nil
 		}
-		d, ok := s.drafts.take(a.DraftID)
+		d, ok := s.drafts.take(oauth.GrantFamily(ctx), a.DraftID)
 		if !ok {
 			return mcp.NewToolResultError("no such draft: it may have expired or already been sent"), nil
 		}

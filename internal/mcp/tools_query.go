@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 )
 
@@ -302,8 +301,11 @@ func (s *Server) registerGetStatus() {
 // The bound client is consulted only once the cache reports a paired device,
 // keeping the awaiting_qr / error envelopes free of any whatsmeow dependency.
 func (s *Server) registerPairingStatus() {
-	tool := mcp.NewTool("pairing_status",
-		mcp.WithDescription("Report the WhatsApp device-pairing state as a structured `setup_state` envelope for programmatic supervisors that surface the linking QR to their own clients (e.g. a polling daemon). Read-only; no side effects. Returns a JSON object `{type:\"setup_state\", state, …}` where `state` is `ready` (paired and connected; adds own_jid/own_phone), `awaiting_qr` (unpaired; adds qr_payload when a pairing code is cached, or expired=true when the last pairing session expired and a new one starts once /pair is opened or a pairing code is requested), or `error` (pairing cache unavailable)."),
+	description := "Report the WhatsApp device-pairing state as a structured `setup_state` envelope for programmatic supervisors that surface the linking QR to their own clients (e.g. a polling daemon). Read-only; no side effects. Returns a JSON object `{type:\"setup_state\", state, …}` where `state` is `ready` (paired and connected; adds own_jid/own_phone), `awaiting_qr` (unpaired; adds qr_payload when a pairing code is cached, or expired=true when the last pairing session expired and a new one starts once /pair is opened or a pairing code is requested), or `error` (pairing cache unavailable)."
+	if s.access != nil {
+		description = "Report the current device pairing state. Returns the setup state and directs the owner to the pairing page when linking is required."
+	}
+	tool := mcp.NewTool("pairing_status", mcp.WithDescription(description),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -331,6 +333,10 @@ func (s *Server) registerPairingStatus() {
 		case s.cache == nil:
 			resp["state"] = "error"
 			resp["detail"] = "pairing cache unavailable"
+		case s.access != nil:
+			resp["state"] = "awaiting_qr"
+			resp["expired"] = s.cache.Expired()
+			resp["detail"] = "Open the owner pairing page at /pair to link WhatsApp."
 		case s.cache.QR() != "":
 			resp["state"] = "awaiting_qr"
 			resp["qr_payload"] = s.cache.QR()

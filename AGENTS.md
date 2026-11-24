@@ -14,7 +14,7 @@ This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-
 ### Packages added
 
 - `internal/vault`: `Key`, per-database subkeys, `OpenDB` (SQLCipher; no plaintext mode; driver `github.com/mutecomm/go-sqlcipher/v4`, which registers as `sqlite3`; do not add `mattn/go-sqlite3`, the two cannot be linked together), key wrapping (`wrap.go`), and `Meta` (`meta.go`): the one deliberately unencrypted database, `meta.db`, holding setup state, sealed key copies, the wrong-guess counter and the sign-in records. Nothing in it is a usable secret.
-- `internal/oauth`: the instance's own OAuth 2.1 server. `store.go` keeps clients, one-time codes and tokens as one-way IDs plus the key sealed under that credential; refresh rotation has a 60 s grace window and revokes the whole chain on later reuse. `server.go` serves the RFC 9728 / RFC 8414 documents, dynamic client registration (callback allowlist: Claude's callbacks and loopback), the consent page (passphrase plus permission ticks), `/token` (PKCE S256, resource binding) and bearer checking.
+- `internal/oauth`: the instance's own OAuth 2.1 server. `store.go` keeps clients, one-time codes and tokens as one-way IDs plus the key sealed under that credential; refresh rotation has a 60 s grace window and revokes the whole chain on later reuse. `server.go` serves the RFC 9728 / RFC 8414 documents, dynamic client registration (verified ChatGPT and Claude client metadata, exact callbacks and loopback), the consent page (passphrase plus permission ticks), `/token` (PKCE S256, resource binding) and bearer checking.
 - `internal/session`: `Manager` builds the whole runtime on unlock and tears it down on idle lock; it never locks under a running request.
 - `internal/gateway`: the always-on front door. Serves `/healthz`, `/readyz` (both mean "process up"; locked is the resting state), sign-in, `/setup`, and lets `/mcp` through only with a valid token and `/pair` only with an owner sign-in.
 
@@ -46,7 +46,7 @@ This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-
 
 ### Not done yet
 
-Client ID metadata documents (only dynamic registration today), forwarding an existing message's media without re-uploading, a migration path for a store created in key-in-environment mode, per-address limiting of wrong passphrases, and rate limiting of `edit_message` / `delete_message`. Binding to loopback behind a reverse proxy on the same host is rejected by the MCP library's Host check (hosted instances bind `0.0.0.0`). The Blueprint has been validated but not deployed. Sections below still describe upstream behaviour where they have not been touched.
+Forwarding an existing message's media without re-uploading, a migration path for a store created in key-in-environment mode, per-address limiting of wrong passphrases. Binding to loopback behind a reverse proxy on the same host is rejected by the MCP library's Host check (hosted instances bind `0.0.0.0`). The Blueprint has been validated but not deployed. Sections below still describe upstream behaviour where they have not been touched.
 
 ## Structure
 

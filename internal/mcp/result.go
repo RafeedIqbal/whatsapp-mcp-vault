@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/sealjay/mcp-whatsapp/internal/client"
 	"github.com/sealjay/mcp-whatsapp/internal/ingest"
 )
@@ -44,14 +43,14 @@ type mediaSummary struct {
 // an ImageContent or AudioContent for images and audio, and an embedded
 // resource (addressed by uri) for videos and documents, which have no content
 // type of their own.
-func downloadMediaResult(r client.DownloadResult, uri string, files *Files) (*mcp.CallToolResult, error) {
+func downloadMediaResult(family string, r client.DownloadResult, uri string, files *Files) (*mcp.CallToolResult, error) {
 	sum := mediaSummary{DownloadResult: r}
 	var media mcp.Content
 	if r.Success && len(r.Data) > 0 {
 		if len(r.Data) > inlineMediaMaxBytes {
 			sum.Note = fmt.Sprintf("media is too large to return (%d bytes; the limit is %d)", len(r.Data), inlineMediaMaxBytes)
 			if files != nil && files.Transfers != nil {
-				_, link, err := files.Transfers.OfferDownload(ingest.Blob{Filename: r.Filename, ContentType: sniffResourceMIME(r.Data, r.MediaType), Data: r.Data})
+				_, link, err := files.Transfers.OfferDownload(family, ingest.Blob{Filename: r.Filename, ContentType: sniffResourceMIME(r.Data, r.MediaType), Data: r.Data})
 				if err == nil {
 					sum.DownloadURL = link
 					sum.DownloadExpiresIn = int(files.Transfers.TTL().Seconds())

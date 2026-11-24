@@ -9,8 +9,8 @@
 #      dashboard and give it, with the service's address, to that person.
 #   2. They open https://<service>.onrender.com/setup, enter the setup code,
 #      choose a passphrase, save the recovery code and link WhatsApp.
-#   3. In Claude they add https://<service>.onrender.com/mcp as a custom
-#      connector and approve it with their passphrase.
+#   3. In both ChatGPT and Claude they add https://<service>.onrender.com/mcp as a custom
+#      connector and approve each app separately with their passphrase.
 #
 # See docs/hosting.md for details and for what the host can and cannot see.
 
