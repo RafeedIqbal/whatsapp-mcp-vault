@@ -7,10 +7,17 @@ Reviewed 24 November 2026 against baseline `9152ab3`. The review followed data f
 | High | Git could stage the untracked local vault key. Installation and container publishing pointed to upstream. | Ignore the private directory and use the fork for installation and image publishing. Verify with `git check-ignore .local/vault.key`. |
 | High | Owner sessions held a usable key independently of the configured idle lock. | Store a one-way cookie ID and a key sealed under the browser cookie. Gateway tests cover configured expiry, recovery and explicit lock. |
 | High | Two assistants with matching permissions shared a draft store. The owner could only revoke all apps together. | Key pending sends and uploads by the issuing grant family. Validate browser links against the active family. Owner controls and two-client tests exercise independent revocation. |
+| High | The hosted status tool exposed the device pairing QR to read grants. | Keep the QR on the owner pairing page. The hosted status tests cover every permission tier. |
+| Medium | Message IDs can repeat across chats. A context lookup could return a different chat’s conversation. | Resolve the composite message key and request the chat when an ID is ambiguous. Research links identify one archived row across restarts. |
+| Medium | Attachment confirmation could resolve a different file when a link changed. | Stage the bytes when drafting. A regression test changes the remote file before confirmation and checks the bytes handed to the sender. |
 | Medium | Archive opening rewrote timestamps and updated the full-text index on every unlock. | Commit legacy migrations and their version marker in one transaction. A regression fixture rejects a repeated rewrite and verifies rollback. |
 | Medium | Expired files could stay resident until another transfer or lock. | Run expiry independently of requests in both modes and test memory accounting on a quiet instance. |
 | Medium | The MCP SDK contained a client transport advisory. The baseline Go scan found zero affected symbols called by this server. | Upgrade to v1.6.0 and run the protocol tests. [Go vulnerability report](https://pkg.go.dev/vuln/GO-2026-6911) |
 | Medium | Standard CI skipped binary OAuth tests and Linux image boot. | Run binary end-to-end tests and boot the Dockerfile with an ephemeral encrypted volume and networking disabled. |
+
+## Verification
+
+The binary end-to-end tests use disposable vaults and two independent OAuth clients. They cover discovery, separate consent, refresh and revocation, concurrent archive reads, private citation pages, idle locking and process restart. Unit and race tests cover published client metadata, archive migrations, scope filtering, confirmation and transfers. CI also builds and boots the Linux image. The connector product interfaces and delivery to a paired phone require a separate hosted acceptance test.
 
 ## Coverage and residual risks
 

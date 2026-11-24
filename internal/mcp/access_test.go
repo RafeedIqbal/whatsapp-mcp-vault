@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"encoding/json"
+	"slices"
 	"sort"
 	"testing"
 )
@@ -46,7 +48,7 @@ func TestAccessTiersExposeOnlyWhatWasGranted(t *testing.T) {
 		"read and manage": {Access{Manage: true}, true, false, true},
 		"everything":      {Access{Send: true, Manage: true}, true, true, true},
 	} {
-		got := toolNames(NewServerWithAccess(nil, nil, false, tc.access))
+		got := toolNames(NewServerWithAccess(nil, nil, false, tc.access, "https://wa.example.test"))
 		if got[readTool] != tc.wantRead || got[sendTool] != tc.wantSend || got[manageTool] != tc.wantMg {
 			t.Errorf("%s: read=%v send=%v manage=%v, want %v %v %v", name,
 				got[readTool], got[sendTool], got[manageTool], tc.wantRead, tc.wantSend, tc.wantMg)
@@ -55,7 +57,7 @@ func TestAccessTiersExposeOnlyWhatWasGranted(t *testing.T) {
 }
 
 func TestReadOnlyAccessHasNoToolThatChangesAnything(t *testing.T) {
-	for name := range toolNames(NewServerWithAccess(nil, nil, true, Access{})) {
+	for name := range toolNames(NewServerWithAccess(nil, nil, true, Access{}, "https://wa.example.test")) {
 		if !readOnlyToolAccess[name] {
 			t.Errorf("read-only access exposes %q", name)
 		}
@@ -63,7 +65,7 @@ func TestReadOnlyAccessHasNoToolThatChangesAnything(t *testing.T) {
 }
 
 func TestSendAccessNeverIncludesManageTools(t *testing.T) {
-	got := toolNames(NewServerWithAccess(nil, nil, true, Access{Send: true}))
+	got := toolNames(NewServerWithAccess(nil, nil, true, Access{Send: true}, "https://wa.example.test"))
 	var leaked []string
 	for name := range manageToolAccess {
 		if got[name] {
@@ -83,8 +85,19 @@ func TestSendAccessNeverIncludesManageTools(t *testing.T) {
 }
 
 func TestFullAccessMatchesTheUnrestrictedServer(t *testing.T) {
-	full := toolNames(NewServerWithAccess(nil, nil, true, Access{Send: true, Manage: true}))
+	full := toolNames(NewServerWithAccess(nil, nil, true, Access{Send: true, Manage: true}, "https://wa.example.test"))
 	plain := toolNames(NewServer(nil, nil, true))
+	for _, name := range []string{"search", "fetch"} {
+		if !full[name] || plain[name] {
+			t.Fatalf("unexpected research tool availability for %s", name)
+		}
+		delete(full, name)
+	}
+	for name := range plain {
+		if !full[name] {
+			t.Errorf("hosted server missing %s", name)
+		}
+	}
 	if len(full) != len(plain) {
 		t.Fatalf("full access has %d tools, unrestricted server has %d", len(full), len(plain))
 	}
@@ -101,6 +114,44 @@ func TestAccessFromScope(t *testing.T) {
 	} {
 		if got := AccessFromScope(scope); got != want {
 			t.Errorf("AccessFromScope(%q) = %+v, want %+v", scope, got, want)
+		}
+	}
+}
+
+func TestResearchToolDiscovery(t *testing.T) {
+	s := NewServerWithAccess(nil, nil, false, Access{}, "https://wa.example.test")
+	for name, fields := range map[string][]string{"search": {"results"}, "fetch": {"id", "title", "url", "text", "metadata"}} {
+		desc := s.MCP().GetTool(name)
+		b, err := json.Marshal(desc.Tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire struct {
+			Meta struct {
+				Schemes []struct {
+					Type   string
+					Scopes []string
+				} `json:"securitySchemes"`
+			} `json:"_meta"`
+			Output struct {
+				Properties map[string]json.RawMessage
+				Required   []string
+			} `json:"outputSchema"`
+			Annotations struct {
+				ReadOnly bool `json:"readOnlyHint"`
+			} `json:"annotations"`
+		}
+		if err := json.Unmarshal(b, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if !wire.Annotations.ReadOnly || len(wire.Meta.Schemes) != 1 || wire.Meta.Schemes[0].Type != "oauth2" ||
+			len(wire.Meta.Schemes[0].Scopes) != 1 || wire.Meta.Schemes[0].Scopes[0] != "whatsapp.read" {
+			t.Fatalf("%s discovery: %s", name, b)
+		}
+		for _, field := range fields {
+			if wire.Output.Properties[field] == nil || !slices.Contains(wire.Output.Required, field) {
+				t.Errorf("%s output lacks required %s: %s", name, field, b)
+			}
 		}
 	}
 }

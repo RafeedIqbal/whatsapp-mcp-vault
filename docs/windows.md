@@ -1,6 +1,6 @@
 # Windows build
 
-`go-sqlite3` needs CGO and a C compiler. Install [MSYS2](https://www.msys2.org/), then in its UCRT64 terminal install GCC:
+The bundled SQLCipher driver needs CGO and a C compiler. Install [MSYS2](https://www.msys2.org/), then in its UCRT64 terminal install GCC:
 
 ```sh
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc
@@ -16,4 +16,4 @@ New-Item -ItemType Directory -Force bin
 go build -o .\bin\whatsapp-mcp.exe .\cmd\whatsapp-mcp
 ```
 
-The direct Go command avoids requiring GNU Make and Bash on Windows. If CGO is disabled or GCC is missing from `PATH`, the build reports that `go-sqlite3` requires cgo.
+The direct Go command avoids requiring GNU Make and Bash on Windows. Keep GCC on `PATH` and CGO enabled for encrypted database support.

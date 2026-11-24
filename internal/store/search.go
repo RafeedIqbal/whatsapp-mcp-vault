@@ -52,6 +52,14 @@ func ensureSearchIndex(db *sql.DB) error {
 	return nil
 }
 
+// messageSearchPredicate binds user text separately for both search paths.
+func messageSearchPredicate(query string) (string, string) {
+	if match := searchMatchExpr(query); match != "" {
+		return "messages.rowid IN (SELECT docid FROM messages_fts WHERE messages_fts MATCH ?)", match
+	}
+	return "instr(lower(messages.content), lower(?)) > 0", query
+}
+
 // maxSearchTerms bounds how many words of a query are used.
 const maxSearchTerms = 16
 

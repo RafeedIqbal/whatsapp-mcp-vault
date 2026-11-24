@@ -56,28 +56,38 @@ type signInDaemon struct {
 	storeDir string
 	logs     *syncBuffer
 	browser  *http.Client
+	stop     func()
 }
 
 func startSignInDaemon(t *testing.T, idleLock string) *signInDaemon {
+	t.Helper()
+	return startSignInDaemonAt(t, idleLock, t.TempDir(), fmt.Sprintf("127.0.0.1:%d", freePort(t)))
+}
+
+func startSignInDaemonAt(t *testing.T, idleLock, storeDir, addr string) *signInDaemon {
 	t.Helper()
 	repo := repoRoot(t)
 	bin := filepath.Join(repo, "bin", "whatsapp-mcp")
 	if _, err := os.Stat(bin); err != nil {
 		t.Fatalf("binary not built (run make build): %v", err)
 	}
-	storeDir := t.TempDir()
-	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	logs := &syncBuffer{}
 	cmd := exec.Command(bin, "-store", storeDir, "serve", "-addr", addr)
-	cmd.Env = append(envWithout(os.Environ(), "WHATSAPP_MCP_VAULT_KEY"), "SETUP_TOKEN="+e2eSetupToken, "IDLE_LOCK="+idleLock)
+	env := os.Environ()
+	for _, name := range []string{"WHATSAPP_MCP_VAULT_KEY", "SEND_CONFIRM", "OAUTH_REDIRECT_ALLOWLIST"} {
+		env = envWithout(env, name)
+	}
+	cmd.Env = append(env, "SETUP_TOKEN="+e2eSetupToken, "IDLE_LOCK="+idleLock, "PUBLIC_URL=http://"+addr,
+		"WHATSAPP_MCP_READ_ONLY=0", "WHATSAPP_MCP_ALLOW_REMOTE=0", "ALLOW_NEW_RECIPIENTS=false")
 	cmd.Stdout, cmd.Stderr = logs, io.MultiWriter(logs, os.Stderr)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start daemon: %v", err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	stop := sync.OnceFunc(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	t.Cleanup(stop)
 
 	jar, _ := cookiejar.New(nil)
-	d := &signInDaemon{t: t, base: "http://" + addr, storeDir: storeDir, logs: logs,
+	d := &signInDaemon{t: t, base: "http://" + addr, storeDir: storeDir, logs: logs, stop: stop,
 		browser: &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {

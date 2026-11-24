@@ -112,7 +112,7 @@ func TestPairingStatus_AwaitingQRExpired(t *testing.T) {
 
 func TestHostedPairingStatusKeepsQRInOwnerPage(t *testing.T) {
 	for _, a := range []Access{{}, {Send: true, Manage: true}} {
-		env := callPairingStatus(t, NewServerWithAccess(nil, fakePairCache{qr: "test QR"}, false, a))
+		env := callPairingStatus(t, NewServerWithAccess(nil, fakePairCache{qr: "test QR"}, false, a, "https://wa.example.test"))
 		if env["state"] != "awaiting_qr" || env["qr_payload"] != nil {
 			t.Fatalf("hosted pairing state = %v", env)
 		}

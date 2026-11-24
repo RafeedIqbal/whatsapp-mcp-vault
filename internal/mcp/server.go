@@ -45,22 +45,22 @@ type Server struct {
 var Version = "dev"
 
 func NewServer(c *client.Client, cache pairingCache, labelsEnabled bool) *Server {
-	return newServer(c, cache, false, labelsEnabled, nil)
+	return newServer(c, cache, false, labelsEnabled, nil, "")
 }
 
 // NewReadOnlyServer excludes tools that can mutate the WhatsApp account.
 func NewReadOnlyServer(c *client.Client, cache pairingCache, labelsEnabled bool) *Server {
-	return newServer(c, cache, true, labelsEnabled, nil)
+	return newServer(c, cache, true, labelsEnabled, nil, "")
 }
 
 // NewServerWithAccess exposes only the tools a signed-in client was granted:
 // read-only tools always, send and manage tools only with those grants.
 // Calling a tool outside the grant fails as an unknown tool.
-func NewServerWithAccess(c *client.Client, cache pairingCache, labelsEnabled bool, access Access) *Server {
-	return newServer(c, cache, !access.Send && !access.Manage, labelsEnabled, &access)
+func NewServerWithAccess(c *client.Client, cache pairingCache, labelsEnabled bool, access Access, publicURL string) *Server {
+	return newServer(c, cache, !access.Send && !access.Manage, labelsEnabled, &access, publicURL)
 }
 
-func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool, access *Access) *Server {
+func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool, access *Access, publicURL string) *Server {
 	instructions := baseInstructions
 	if readOnly {
 		instructions += " This server is in read-only mode: tools cannot send messages or mutate the WhatsApp account. Downloads and history requests can still retrieve data and write the local cache. An explicit media download may ask your own phone to re-upload an expired attachment; it never notifies the sender or chat. Pairing remains an operator action through /pair."
@@ -76,6 +76,9 @@ func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled boo
 		server.WithToolHandlerMiddleware(s.confirmMiddleware),
 	)
 	s.registerTools()
+	if access != nil {
+		s.registerResearchTools(publicURL)
+	}
 	var tools []server.ServerTool
 	for name, tool := range s.mcp.ListTools() {
 		if readOnly && !readOnlyToolAccess[name] || access != nil && !access.allows(name) {

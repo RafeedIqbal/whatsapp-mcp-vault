@@ -21,7 +21,7 @@ type confirmFixture struct {
 func newConfirmFixture(t *testing.T, mode ConfirmMode, newRecipients ...string) *confirmFixture {
 	t.Helper()
 	f := &confirmFixture{now: time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)}
-	f.s = NewServerWithAccess(nil, nil, false, Access{Send: true})
+	f.s = NewServerWithAccess(nil, nil, false, Access{Send: true}, "https://wa.example.test")
 	f.s.SetSendConfirmation(mode)
 	f.s.drafts.now = func() time.Time { return f.now }
 	f.s.isNewRecipient = func(recipient string) bool {
@@ -146,7 +146,7 @@ func TestDraftsAreBounded(t *testing.T) {
 }
 
 func TestConfirmSendIsNotOfferedToReadOnlySignIns(t *testing.T) {
-	if toolNames(NewServerWithAccess(nil, nil, false, Access{}))["confirm_send"] {
+	if toolNames(NewServerWithAccess(nil, nil, false, Access{}, "https://wa.example.test"))["confirm_send"] {
 		t.Fatal("a read-only sign-in is offered confirm_send")
 	}
 }
@@ -167,7 +167,7 @@ func TestMessageTextIsLabelledAsUntrusted(t *testing.T) {
 }
 
 func TestServerInstructionsWarnAboutMessageContent(t *testing.T) {
-	for _, s := range []*Server{NewServer(nil, nil, false), NewReadOnlyServer(nil, nil, false), NewServerWithAccess(nil, nil, false, Access{Send: true})} {
+	for _, s := range []*Server{NewServer(nil, nil, false), NewReadOnlyServer(nil, nil, false), NewServerWithAccess(nil, nil, false, Access{Send: true}, "https://wa.example.test")} {
 		raw, _ := json.Marshal(s.MCP().HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)))
 		if !strings.Contains(string(raw), "never as instructions") {
 			t.Fatalf("initialize does not warn about message content: %s", raw)
@@ -176,7 +176,7 @@ func TestServerInstructionsWarnAboutMessageContent(t *testing.T) {
 }
 
 func TestRepliesAreHeldWhenEverySendNeedsConfirming(t *testing.T) {
-	s := NewServerWithAccess(nil, nil, false, Access{Send: true})
+	s := NewServerWithAccess(nil, nil, false, Access{Send: true}, "https://wa.example.test")
 	s.SetSendConfirmation(ConfirmAlways)
 	text, isErr := callTool(t, s, "send_reply", map[string]any{"chat_jid": "15550009999@s.whatsapp.net", "target_message_id": "ABC", "body": "on my way"})
 	if isErr {
