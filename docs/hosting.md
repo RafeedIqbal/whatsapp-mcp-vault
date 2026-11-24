@@ -83,6 +83,7 @@ What this does not protect against:
 
 - **Sending a file:** by a public https link, by a one-time upload page (`create_upload_link`, for a file on the person's own device), or inline for files up to 5 MB. Links to private or local addresses are refused. Files of up to 64 MB can be sent.
 - **Receiving media:** images and voice notes come back inline; documents and videos up to 5 MB come back as an attachment in the result; anything larger, up to 64 MB, comes back as a one-time download link that expires after ten minutes. The link always downloads the file; it never opens it in the browser.
+- Voice-note conversion accepts the uploaded stream over a pipe. Conversion stops after five minutes or when the caller cancels. If a clip needs a format the streaming converter cannot read, send it as an audio attachment with `send_file`.
 - At most two media files are fetched at once, and at most 128 MB of uploads and downloads is held in memory at a time.
 - Messages can only be sent to people and groups, never to broadcast addresses (such as status) or channels.
 

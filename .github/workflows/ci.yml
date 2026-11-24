@@ -46,6 +46,13 @@ jobs:
         run: |
           docker build --tag whatsapp-vault:ci .
           docker run --rm --network none --env WHATSAPP_MCP_VAULT_KEY="$(openssl rand -hex 32)" whatsapp-vault:ci smoke
+      - name: Verify the packaged voice encoder
+        run: |
+          docker run --rm --network none --user 10001 --entrypoint ffmpeg whatsapp-vault:ci \
+            -v error -f lavfi -i anullsrc=r=8000:cl=mono -t 0.2 -f wav pipe:1 |
+          docker run --rm -i --network none --user 10001 --entrypoint ffmpeg whatsapp-vault:ci \
+            -v error -protocol_whitelist pipe -i pipe:0 -vn -c:a libopus -f ogg pipe:1 > "$RUNNER_TEMP/voice.ogg"
+          test "$(head -c 4 "$RUNNER_TEMP/voice.ogg")" = OggS
       - name: mdtest parity grep
         # Fails if a whatsmeow method we call disappears upstream — an early
         # signal that the API was removed or renamed.

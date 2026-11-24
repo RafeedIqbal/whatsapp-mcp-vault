@@ -312,7 +312,7 @@ For the launchd and systemd templates, initialise a passphrase vault once in the
 | Claude Code hook | Put `docs/hooks/setup.sh` in `.claude/hooks/` and call it from `settings.json` (idempotent) |
 | Manual | `./bin/whatsapp-mcp serve` |
 
-**Docker (local access).** The image (`debian:bookworm-slim` plus ffmpeg, a few hundred MB) keeps its data in `/home/app/store`; persist that volume. A container has to listen beyond its own loopback for a published port to work, so it runs in passphrase sign-in mode even locally. This example publishes the port on the host's loopback only. To host it for remote clients, see [docs/hosting.md](docs/hosting.md).
+**Docker (local access).** The image (`debian:trixie-slim` plus ffmpeg, a few hundred MB) keeps its data in `/home/app/store`; persist that volume. A container has to listen beyond its own loopback for a published port to work, so it runs in passphrase sign-in mode even locally. This example publishes the port on the host's loopback only. To host it for remote clients, see [docs/hosting.md](docs/hosting.md).
 
 ```bash
 docker build -t whatsapp-mcp --build-arg VERSION=$(git describe --tags --always) .

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,5 +87,30 @@ func TestConvertToOpusOggBytesDoesNotNeedTheServerEnvironment(t *testing.T) {
 	}
 	if out, err := ConvertToOpusOggBytes(context.Background(), silentWAV(200)); err != nil || len(out) == 0 {
 		t.Fatalf("conversion with the minimal environment failed: %v", err)
+	}
+}
+
+func TestConversionDiagnosticsKeepOnlyThePrefix(t *testing.T) {
+	var retained diagnosticPrefix
+	first := bytes.Repeat([]byte("x"), maxDiagnosticBytes-1)
+	second := bytes.Repeat([]byte("y"), maxDiagnosticBytes*8)
+	for _, part := range [][]byte{first, second, second} {
+		if n, err := retained.Write(part); n != len(part) || err != nil {
+			t.Fatalf("drain = %d, %v", n, err)
+		}
+	}
+	if len(retained) != maxDiagnosticBytes || !bytes.Equal(retained[:len(first)], first) || retained[len(first)] != 'y' {
+		t.Fatal("diagnostic limit or prefix changed")
+	}
+}
+
+func TestConversionHonoursCallerDeadline(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ConvertToOpusOggBytes(ctx, silentWAV(200)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled conversion: %v", err)
 	}
 }

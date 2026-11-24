@@ -13,11 +13,17 @@ Reviewed 24 November 2026 against baseline `9152ab3`. The review followed data f
 | Medium | Archive opening rewrote timestamps and updated the full-text index on every unlock. | Commit legacy migrations and their version marker in one transaction. A regression fixture rejects a repeated rewrite and verifies rollback. |
 | Medium | Expired files could stay resident until another transfer or lock. | Run expiry independently of requests in both modes and test memory accounting on a quiet instance. |
 | Medium | The MCP SDK contained a client transport advisory. The baseline Go scan found zero affected symbols called by this server. | Upgrade to v1.6.0 and run the protocol tests. [Go vulnerability report](https://pkg.go.dev/vuln/GO-2026-6911) |
+| Medium | Debian classified 23 open mbedTLS records in the Bookworm runtime as end-of-life. | Move the runtime to a digest-pinned Debian 13 image. The rebuilt image passed offline voice encoding and reopened an encrypted volume created by the previous image. [Debian mbedTLS tracker](https://security-tracker.debian.org/tracker/source-package/mbedtls) |
+| Medium | Native voice-note conversion accepted the decoder’s protocol defaults and collected its entire diagnostic stream in memory. | Restrict input protocols to pipes, cap retained diagnostics at 4 KiB and enforce a five-minute conversion deadline. Test the packaged encoder with synthetic audio and networking disabled. |
 | Medium | Standard CI skipped binary OAuth tests and Linux image boot. | Run binary end-to-end tests and boot the Dockerfile with an ephemeral encrypted volume and networking disabled. |
 
 ## Verification
 
 The binary end-to-end tests use disposable vaults and two independent OAuth clients. They cover discovery, separate consent, refresh and revocation, concurrent archive reads, private citation pages, idle locking and process restart. Unit and race tests cover published client metadata, archive migrations, scope filtering, confirmation and transfers. CI also builds and boots the Linux image. The connector product interfaces and delivery to a paired phone require a separate hosted acceptance test.
+
+Two additional local checks used the providers’ live public client documents for consent, PKCE and tool discovery, then exercised the Linux container with a public Host header and HTTPS issuer. The account fixtures stayed on loopback in both checks.
+
+The Go source scan with `govulncheck v1.10.0` reported zero vulnerabilities. For the local Linux/arm64 image, we also compared all 203 installed Debian source packages with the Debian 13 tracker on 24 November 2026. The image included FFmpeg `7:7.1.5-0+deb13u1` and mbedTLS `3.6.6-0.1~deb13u1`. The tracker listed no released fixes newer than the installed versions. It still listed 466 open source-package records across those packages, including 366 awaiting urgency assignment. Assessing their effect on this binary requires checking which native code paths it uses. [Debian tracker data](https://security-tracker.debian.org/tracker/data/json)
 
 ## Coverage and residual risks
 
