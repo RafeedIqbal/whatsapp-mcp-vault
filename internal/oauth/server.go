@@ -45,6 +45,7 @@ const (
 // loopback callbacks (a client running on the owner's own machine) are always
 // accepted.
 var defaultRedirectURIs = []string{
+	chatGPTCallback,
 	"https://claude.ai/api/mcp/auth_callback",
 	"https://claude.com/api/mcp/auth_callback",
 }
@@ -72,6 +73,9 @@ type Server struct {
 
 	mu             sync.Mutex
 	pending        map[string]pendingConsent
+	metadataMu     sync.Mutex
+	metadata       map[string]cachedClient
+	fetchMetadata  func(context.Context, string) ([]byte, error)
 	pendingSeq     uint64
 	regWindowStart time.Time
 	regCount       int
@@ -94,7 +98,7 @@ func NewServer(cfg Config) *Server {
 		cfg.Now = time.Now
 	}
 	issuer := strings.TrimRight(cfg.Issuer, "/")
-	return &Server{cfg: cfg, issuer: issuer, resource: issuer + resourcePath, pending: map[string]pendingConsent{}}
+	return &Server{cfg: cfg, issuer: issuer, resource: issuer + resourcePath, metadata: make(map[string]cachedClient), fetchMetadata: fetchClientDocument, pending: map[string]pendingConsent{}}
 }
 
 // Resource is the identifier of the protected MCP endpoint (issuer + /mcp).
@@ -127,6 +131,7 @@ func (s *Server) handleServerMetadata(w http.ResponseWriter, _ *http.Request) {
 		"issuer":                                         s.issuer,
 		"authorization_endpoint":                         s.issuer + "/authorize",
 		"token_endpoint":                                 s.issuer + "/token",
+		"client_id_metadata_document_supported":          true,
 		"registration_endpoint":                          s.issuer + "/register",
 		"response_types_supported":                       []string{"code"},
 		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
@@ -284,7 +289,7 @@ func (s *Server) handleAuthorizePage(w http.ResponseWriter, r *http.Request) {
 	// Until the client and its callback are verified, errors are shown here
 	// and never sent anywhere: redirecting would hand control to whoever
 	// crafted the link.
-	client, err := s.cfg.Store.Client(r.Context(), q.Get("client_id"))
+	client, err := s.resolveClient(r.Context(), q.Get("client_id"))
 	if err != nil {
 		s.renderError(w, http.StatusBadRequest, "This sign-in link is not valid: the application is not registered with this server.")
 		return
@@ -488,6 +493,10 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		pair, err = s.exchangeCode(r.Context(), f, clientID)
 	case "refresh_token":
+		if resource := f.Get("resource"); resource != "" && resource != s.resource {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_target", "refresh must target this MCP resource")
+			return
+		}
 		pair, err = s.cfg.Store.Refresh(r.Context(), f.Get("refresh_token"), clientID)
 	default:
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "use authorization_code or refresh_token")
@@ -511,7 +520,10 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) exchangeCode(ctx context.Context, f url.Values, clientID string) (TokenPair, error) {
-	g, key, err := s.cfg.Store.RedeemCode(ctx, f.Get("code"))
+	store := s.cfg.Store
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	g, key, err := store.redeemCodeLocked(ctx, f.Get("code"))
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -525,7 +537,7 @@ func (s *Server) exchangeCode(ctx context.Context, f url.Values, clientID string
 	if !pkceMatches(f.Get("code_verifier"), g.CodeChallenge) {
 		return TokenPair{}, ErrInvalidGrant
 	}
-	return s.cfg.Store.IssueTokens(ctx, Grant{ClientID: g.ClientID, Scope: g.Scope, Resource: g.Resource}, key)
+	return store.issuePairLocked(ctx, Grant{ClientID: g.ClientID, Scope: g.Scope, Resource: g.Resource}, key)
 }
 
 // pkceMatches checks an S256 verifier against the challenge sent at /authorize.

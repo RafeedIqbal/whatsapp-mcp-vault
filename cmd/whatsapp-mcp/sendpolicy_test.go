@@ -7,7 +7,7 @@ import (
 )
 
 func TestSendPolicyDefaultsAreTheSafeOnes(t *testing.T) {
-	p, err := sendPolicyFromEnv(envOf(nil))
+	p, err := sendPolicyFromEnv(false, envOf(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestSendPolicyFromEnv(t *testing.T) {
 		"bad boolean":      {map[string]string{"ALLOW_NEW_RECIPIENTS": "sometimes"}, false, 0, false},
 		"bad mode":         {map[string]string{"SEND_CONFIRM": "maybe"}, false, 0, false},
 	} {
-		p, err := sendPolicyFromEnv(envOf(tc.env))
+		p, err := sendPolicyFromEnv(false, envOf(tc.env))
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: err = %v, want ok=%v", name, err, tc.ok)
 			continue
@@ -50,16 +50,23 @@ func TestSendPolicyFromEnv(t *testing.T) {
 // sense while new recipients are refused outright: the draft could never be
 // sent. The confirm step for new recipients only applies once they are allowed.
 func TestConfirmForNewRecipientsOnlyAppliesWhenTheyAreAllowed(t *testing.T) {
-	blocked, _ := sendPolicyFromEnv(envOf(nil))
+	blocked, _ := sendPolicyFromEnv(false, envOf(nil))
 	if got := blocked.effectiveConfirm(); got != mcpsrv.ConfirmOff {
 		t.Errorf("blocked + new_recipients: effective mode = %v, want ConfirmOff", got)
 	}
-	allowed, _ := sendPolicyFromEnv(envOf(map[string]string{"ALLOW_NEW_RECIPIENTS": "true"}))
+	allowed, _ := sendPolicyFromEnv(false, envOf(map[string]string{"ALLOW_NEW_RECIPIENTS": "true"}))
 	if got := allowed.effectiveConfirm(); got != mcpsrv.ConfirmNewRecipients {
 		t.Errorf("allowed + new_recipients: effective mode = %v, want ConfirmNewRecipients", got)
 	}
-	always, _ := sendPolicyFromEnv(envOf(map[string]string{"SEND_CONFIRM": "always"}))
+	always, _ := sendPolicyFromEnv(false, envOf(map[string]string{"SEND_CONFIRM": "always"}))
 	if got := always.effectiveConfirm(); got != mcpsrv.ConfirmAlways {
 		t.Errorf("always: effective mode = %v, want ConfirmAlways", got)
+	}
+}
+
+func TestHostedDefaultsToConfirmationForKnownChats(t *testing.T) {
+	p, err := sendPolicyFromEnv(true, envOf(nil))
+	if err != nil || p.effectiveConfirm() != mcpsrv.ConfirmAlways || !p.blockNewRecipients {
+		t.Fatalf("policy = %+v, %v", p, err)
 	}
 }

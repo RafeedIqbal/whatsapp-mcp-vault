@@ -87,6 +87,10 @@ WhatsApp sends history to a linked device while it pairs, and by default the pho
 - **The phone decides** how much it sends, and delivery and completeness are controlled by WhatsApp. A sync can run for a long while after pairing: keep the phone online and `serve` running.
 - **Storage.** `messages.db` can grow substantially (media is still fetched only on demand).
 
+### Connect ChatGPT and Claude
+
+Host one private passphrase-protected instance per person. Link WhatsApp once at the owner’s pairing page, then add the same HTTPS `/mcp` URL in both products. Each app gets its own permissions, confirmation drafts and disconnect button. [Setup and sign-in guide](docs/hosting.md#connect-chatgpt-and-claude-to-one-account)
+
 ### Connect your MCP client
 
 `serve` serves MCP at `http://127.0.0.1:8765/mcp` (use your configured host and port if you set `WHATSAPP_MCP_ADDR`). It is stateless (no `Mcp-Session-Id`) and speaks MCP 2026-07-28 as well as older revisions. The daemon outlives client restarts, and multiple clients can share it.

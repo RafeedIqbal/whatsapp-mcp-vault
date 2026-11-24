@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sealjay/mcp-whatsapp/internal/ingest"
+	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 )
 
 // Files is how tools move attachments in and out without the server's disk:
@@ -76,7 +77,7 @@ func (s *Server) resolveAttachment(ctx context.Context, src attachmentSource) (i
 		if s.files == nil || s.files.Transfers == nil {
 			return ingest.Blob{}, errors.New("this server has no upload page; send the file with data_base64 instead")
 		}
-		b, err := s.files.Transfers.TakeUpload(strings.TrimSpace(src.UploadID))
+		b, err := s.files.Transfers.TakeUpload(oauth.GrantFamily(ctx), strings.TrimSpace(src.UploadID))
 		if err != nil {
 			return ingest.Blob{}, err
 		}

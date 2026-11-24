@@ -31,7 +31,7 @@ func (p sendPolicy) effectiveConfirm() mcpsrv.ConfirmMode {
 
 // sendPolicyFromEnv reads ALLOW_NEW_RECIPIENTS (default false) and
 // SEND_CONFIRM (new_recipients by default; always; off).
-func sendPolicyFromEnv(getenv func(string) string) (sendPolicy, error) {
+func sendPolicyFromEnv(hosted bool, getenv func(string) string) (sendPolicy, error) {
 	p := sendPolicy{blockNewRecipients: true, confirm: mcpsrv.ConfirmNewRecipients}
 	if v := strings.TrimSpace(getenv("ALLOW_NEW_RECIPIENTS")); v != "" {
 		allow, err := strconv.ParseBool(v)
@@ -41,7 +41,11 @@ func sendPolicyFromEnv(getenv func(string) string) (sendPolicy, error) {
 		p.blockNewRecipients = !allow
 	}
 	switch strings.ToLower(strings.TrimSpace(getenv("SEND_CONFIRM"))) {
-	case "", "new_recipients":
+	case "":
+		if hosted {
+			p.confirm = mcpsrv.ConfirmAlways
+		}
+	case "new_recipients":
 	case "always":
 		p.confirm = mcpsrv.ConfirmAlways
 	case "off":

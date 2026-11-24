@@ -7,13 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
+	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	wmstore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
-
-	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
+	"google.golang.org/protobuf/proto"
 )
 
 // MarkRead marks messageIDs as read for the given chat. senderJID is the
@@ -336,7 +334,7 @@ func (c *Client) EditMessage(ctx context.Context, chatJID, messageID, newBody st
 		Conversation: proto.String(newBody),
 	}
 	edit := c.waClient().BuildEdit(chat, types.MessageID(messageID), newContent)
-	if _, err := c.waClient().SendMessage(ctx, chat, edit); err != nil {
+	if _, err := c.sendMessage(ctx, chat, edit); err != nil {
 		return fmt.Errorf("send edit: %w", err)
 	}
 	c.recordOwnEdit(ctx, chat, messageID, newBody)
@@ -363,7 +361,7 @@ func (c *Client) DeleteMessage(ctx context.Context, chatJID, messageID, senderJI
 	}
 
 	revoke := c.waClient().BuildRevoke(chat, sender, types.MessageID(messageID))
-	if _, err := c.waClient().SendMessage(ctx, chat, revoke); err != nil {
+	if _, err := c.sendMessage(ctx, chat, revoke); err != nil {
 		return fmt.Errorf("send revoke: %w", err)
 	}
 	c.recordOwnRevoke(ctx, chat, revoke.GetProtocolMessage().GetKey())

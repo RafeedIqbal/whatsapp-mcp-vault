@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/sealjay/mcp-whatsapp/internal/client"
 	"github.com/sealjay/mcp-whatsapp/internal/ingest"
 )
@@ -98,7 +97,7 @@ func TestLinkedAttachmentIsFetchedThroughTheSafeFetcher(t *testing.T) {
 func TestUploadedAttachmentIsTakenOnce(t *testing.T) {
 	f := testFiles(nil)
 	s := serverWithFiles(Access{Send: true}, f)
-	id, _, _ := f.Transfers.NewUploadSlot()
+	id, _, _ := f.Transfers.NewUploadSlot("")
 	if _, err := s.resolveAttachment(context.Background(), attachmentSource{UploadID: id}); !errors.Is(err, ingest.ErrNotUploaded) {
 		t.Fatalf("before the upload err = %v, want ErrNotUploaded", err)
 	}
@@ -224,13 +223,40 @@ func TestCreateUploadLinkIsASendTierTool(t *testing.T) {
 	}
 }
 
+func TestConfirmationFreezesLinkedAttachment(t *testing.T) {
+	payload := "original"
+	fetches := 0
+	s := serverWithFiles(Access{Send: true}, testFiles(func(context.Context, string) (ingest.Blob, error) {
+		fetches++
+		return ingest.Blob{Filename: "note.txt", Data: []byte(payload)}, nil
+	}))
+	s.SetSendConfirmation(ConfirmAlways)
+	var sent string
+	s.mcp.AddTool(mcp.NewTool("send_file"), func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		blob, err := s.resolveAttachment(ctx, attachmentSource{UploadID: r.GetString("upload_id", ""), URL: r.GetString("url", "")})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		sent = string(blob.Data)
+		return mcp.NewToolResultText("sent"), nil
+	})
+	preview, failed := callTool(t, s, "send_file", map[string]any{"recipient": "15550009999", "url": "https://example.test/changeable", "caption": "review this"})
+	if failed || strings.Contains(preview, "changeable") || !strings.Contains(preview, "note.txt") || !strings.Contains(preview, "review this") {
+		t.Fatalf("unexpected draft: %s", preview)
+	}
+	payload = "replacement"
+	if _, failed := callTool(t, s, "confirm_send", map[string]any{"draft_id": draftID(t, preview)}); failed || sent != "original" || fetches != 1 {
+		t.Fatalf("confirmed attachment %q, fetches %d, failed %v", sent, fetches, failed)
+	}
+}
+
 // --- large media out -------------------------------------------------------
 
 func TestLargeMediaComesBackAsAOneTimeDownloadLink(t *testing.T) {
 	f := &Files{Transfers: ingest.NewTransfers("https://wa.example.test", 64<<20, 128<<20, 10*time.Minute)}
 	big := make([]byte, inlineMediaMaxBytes+1)
 	copy(big, "big video bytes")
-	res, err := downloadMediaResult(client.DownloadResult{Success: true, Message: "ok", MediaType: "video", Filename: "clip.mp4", Size: len(big), Data: big}, testMediaURI, f)
+	res, err := downloadMediaResult("", client.DownloadResult{Success: true, Message: "ok", MediaType: "video", Filename: "clip.mp4", Size: len(big), Data: big}, testMediaURI, f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +277,7 @@ func TestLargeMediaComesBackAsAOneTimeDownloadLink(t *testing.T) {
 
 func TestLargeMediaWithoutTheFileServiceSaysWhy(t *testing.T) {
 	big := make([]byte, inlineMediaMaxBytes+1)
-	res, _ := downloadMediaResult(client.DownloadResult{Success: true, MediaType: "video", Filename: "clip.mp4", Size: len(big), Data: big}, testMediaURI, nil)
+	res, _ := downloadMediaResult("", client.DownloadResult{Success: true, MediaType: "video", Filename: "clip.mp4", Size: len(big), Data: big}, testMediaURI, nil)
 	sum := summary(t, res)
 	if _, has := sum["download_url"]; has || !strings.Contains(sum["note"].(string), "too large") {
 		t.Fatalf("summary = %v", sum)

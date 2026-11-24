@@ -622,3 +622,59 @@ func TestAFloodOfConsentPagesDoesNotBlockARealSignIn(t *testing.T) {
 		t.Fatalf("the oldest consent page was not the one dropped: status %d", resp.StatusCode)
 	}
 }
+
+func TestPublishedClientsCompletePKCEAndKeepTheirCallbacks(t *testing.T) {
+	for id, provider := range publishedClients {
+		t.Run(provider.name, func(t *testing.T) {
+			f := newServerFixture(t)
+			calls := 0
+			f.oauth.fetchMetadata = func(_ context.Context, got string) ([]byte, error) {
+				if got != id {
+					t.Fatalf("fetched %q", got)
+				}
+				calls++
+				doc := map[string]any{"client_id": id, "redirect_uris": []string{provider.callback}, "token_endpoint_auth_method": "none"}
+				if provider.name == "ChatGPT" {
+					doc["token_endpoint_auth_method"] = "private_key_jwt"
+					doc["token_endpoint_auth_methods_supported"] = []string{"none", "private_key_jwt"}
+				}
+				return json.Marshal(doc)
+			}
+			request := f.consent(id, provider.callback, nil)
+			resp, loc, _ := f.approve(request, testPassphrase, ScopeSend)
+			if resp.StatusCode != 302 || loc.Query().Get("iss") != testIssuer || loc.Query().Get("state") != "st4te" {
+				t.Fatal("invalid callback")
+			}
+			resp, _ = f.postForm("/token", url.Values{"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")}, "client_id": {id}, "redirect_uri": {provider.callback}, "code_verifier": {testVerifier}, "resource": {testIssuer + "/mcp"}})
+			if resp.StatusCode != 200 {
+				t.Fatal(resp.StatusCode)
+			}
+			resp, _ = f.get(authorizeQuery(id, "https://example.test/other", nil))
+			if resp.StatusCode != 400 || calls != 1 {
+				t.Fatalf("callback validation status %d, fetches %d", resp.StatusCode, calls)
+			}
+		})
+	}
+}
+
+func TestPublishedClientMustValidateBeforeCaching(t *testing.T) {
+	f := newServerFixture(t)
+	const id = "https://chatgpt.com/oauth/client.json"
+	for _, doc := range []map[string]any{
+		{"client_id": "wrong", "redirect_uris": []string{chatGPTCallback}, "token_endpoint_auth_method": "none"},
+		{"client_id": id, "redirect_uris": []string{"https://another.example/callback"}, "token_endpoint_auth_method": "none"},
+		{"client_id": id, "redirect_uris": []string{chatGPTCallback}, "token_endpoint_auth_method": "private_key_jwt"},
+	} {
+		f.oauth.fetchMetadata = func(context.Context, string) ([]byte, error) { return json.Marshal(doc) }
+		if _, err := f.oauth.resolveClient(context.Background(), id); err == nil {
+			t.Fatal("accepted invalid metadata")
+		}
+	}
+	f.oauth.fetchMetadata = func(context.Context, string) ([]byte, error) {
+		t.Fatal("made a network request for an unrecognised identity")
+		return nil, nil
+	}
+	if _, err := f.oauth.resolveClient(context.Background(), "https://other.example/client.json"); err == nil {
+		t.Fatal("unknown identity resolved")
+	}
+}

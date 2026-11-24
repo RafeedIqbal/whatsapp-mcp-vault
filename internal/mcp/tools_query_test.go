@@ -109,3 +109,12 @@ func TestPairingStatus_AwaitingQRExpired(t *testing.T) {
 		t.Errorf("detail = %v, want an expiry message", env["detail"])
 	}
 }
+
+func TestHostedPairingStatusKeepsQRInOwnerPage(t *testing.T) {
+	for _, a := range []Access{{}, {Send: true, Manage: true}} {
+		env := callPairingStatus(t, NewServerWithAccess(nil, fakePairCache{qr: "test QR"}, false, a))
+		if env["state"] != "awaiting_qr" || env["qr_payload"] != nil {
+			t.Fatalf("hosted pairing state = %v", env)
+		}
+	}
+}

@@ -182,14 +182,14 @@ func newTransfers(c *clock) *Transfers {
 
 func TestUploadSlotIsFilledOnceAndTakenOnce(t *testing.T) {
 	tr := newTransfers(&clock{t: time.Now()})
-	id, link, err := tr.NewUploadSlot()
+	id, link, err := tr.NewUploadSlot("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(link, "https://wa.example.test/upload/") || !strings.HasSuffix(link, id) || len(id) < 40 {
 		t.Fatalf("link %q id %q", link, id)
 	}
-	if _, err := tr.TakeUpload(id); !errors.Is(err, ErrNotUploaded) {
+	if _, err := tr.TakeUpload("", id); !errors.Is(err, ErrNotUploaded) {
 		t.Fatalf("taking before upload err = %v, want ErrNotUploaded", err)
 	}
 	if err := tr.FillUpload(id, Blob{Filename: "a.txt", Data: []byte("hello")}); err != nil {
@@ -198,11 +198,11 @@ func TestUploadSlotIsFilledOnceAndTakenOnce(t *testing.T) {
 	if err := tr.FillUpload(id, Blob{Filename: "b.txt", Data: []byte("swap")}); err == nil {
 		t.Fatal("a filled slot accepted a second file")
 	}
-	got, err := tr.TakeUpload(id)
+	got, err := tr.TakeUpload("", id)
 	if err != nil || got.Filename != "a.txt" || string(got.Data) != "hello" {
 		t.Fatalf("TakeUpload = %+v err=%v", got, err)
 	}
-	if _, err := tr.TakeUpload(id); !errors.Is(err, ErrNoSuchTransfer) {
+	if _, err := tr.TakeUpload("", id); !errors.Is(err, ErrNoSuchTransfer) {
 		t.Fatalf("second take err = %v, want ErrNoSuchTransfer", err)
 	}
 }
@@ -210,11 +210,11 @@ func TestUploadSlotIsFilledOnceAndTakenOnce(t *testing.T) {
 func TestTransfersExpireAndUnknownIDsFail(t *testing.T) {
 	c := &clock{t: time.Now()}
 	tr := newTransfers(c)
-	up, _, _ := tr.NewUploadSlot()
+	up, _, _ := tr.NewUploadSlot("")
 	tr.FillUpload(up, Blob{Filename: "a", Data: []byte("x")})
-	down, _, _ := tr.OfferDownload(Blob{Filename: "v.mp4", Data: []byte("video")})
+	down, _, _ := tr.OfferDownload("", Blob{Filename: "v.mp4", Data: []byte("video")})
 	c.t = c.t.Add(11 * time.Minute)
-	if _, err := tr.TakeUpload(up); !errors.Is(err, ErrNoSuchTransfer) {
+	if _, err := tr.TakeUpload("", up); !errors.Is(err, ErrNoSuchTransfer) {
 		t.Errorf("expired upload err = %v", err)
 	}
 	if _, ok := tr.TakeDownload(down); ok {
@@ -230,7 +230,7 @@ func TestTransfersExpireAndUnknownIDsFail(t *testing.T) {
 
 func TestDownloadIsServedExactlyOnce(t *testing.T) {
 	tr := newTransfers(&clock{t: time.Now()})
-	id, link, err := tr.OfferDownload(Blob{Filename: "clip.mp4", ContentType: "video/mp4", Data: []byte("video")})
+	id, link, err := tr.OfferDownload("", Blob{Filename: "clip.mp4", ContentType: "video/mp4", Data: []byte("video")})
 	if err != nil || !strings.HasPrefix(link, "https://wa.example.test/media/") {
 		t.Fatalf("OfferDownload link %q err=%v", link, err)
 	}
@@ -244,23 +244,23 @@ func TestDownloadIsServedExactlyOnce(t *testing.T) {
 
 func TestTransfersAreBoundedInMemory(t *testing.T) {
 	tr := newTransfers(&clock{t: time.Now()})
-	if _, _, err := tr.OfferDownload(Blob{Data: make([]byte, 1001)}); !errors.Is(err, ErrTooLarge) {
+	if _, _, err := tr.OfferDownload("", Blob{Data: make([]byte, 1001)}); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("oversized item err = %v, want ErrTooLarge", err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, _, err := tr.OfferDownload(Blob{Data: make([]byte, 1000)}); err != nil {
+		if _, _, err := tr.OfferDownload("", Blob{Data: make([]byte, 1000)}); err != nil {
 			t.Fatalf("item %d: %v", i, err)
 		}
 	}
-	if _, _, err := tr.OfferDownload(Blob{Data: make([]byte, 1000)}); !errors.Is(err, ErrBusy) {
+	if _, _, err := tr.OfferDownload("", Blob{Data: make([]byte, 1000)}); !errors.Is(err, ErrBusy) {
 		t.Errorf("third item past the total cap err = %v, want ErrBusy", err)
 	}
-	slot, _, _ := tr.NewUploadSlot()
+	slot, _, _ := tr.NewUploadSlot("")
 	if err := tr.FillUpload(slot, Blob{Data: make([]byte, 1000)}); !errors.Is(err, ErrBusy) {
 		t.Errorf("upload past the total cap err = %v, want ErrBusy", err)
 	}
 	tr.Clear()
-	if _, _, err := tr.OfferDownload(Blob{Data: make([]byte, 1000)}); err != nil {
+	if _, _, err := tr.OfferDownload("", Blob{Data: make([]byte, 1000)}); err != nil {
 		t.Errorf("after Clear: %v", err)
 	}
 }
@@ -294,7 +294,7 @@ func postFile(t *testing.T, url, filename string, data []byte) *http.Response {
 
 func TestUploadPageAcceptsOneFileForItsSlot(t *testing.T) {
 	tr, srv := transfersServer(t)
-	id, _, _ := tr.NewUploadSlot()
+	id, _, _ := tr.NewUploadSlot("")
 
 	page, err := http.Get(srv.URL + "/upload/" + id)
 	if err != nil || page.StatusCode != http.StatusOK {
@@ -308,7 +308,7 @@ func TestUploadPageAcceptsOneFileForItsSlot(t *testing.T) {
 	if resp := postFile(t, srv.URL+"/upload/"+id, "../../etc/passwd", []byte("contents")); resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload: status %d", resp.StatusCode)
 	}
-	got, err := tr.TakeUpload(id)
+	got, err := tr.TakeUpload("", id)
 	if err != nil || string(got.Data) != "contents" {
 		t.Fatalf("TakeUpload = %+v err=%v", got, err)
 	}
@@ -325,11 +325,11 @@ func TestUploadPageRejectsUnknownSlotsAndOversizedFiles(t *testing.T) {
 	if resp := postFile(t, srv.URL+"/upload/not-a-real-slot", "a.txt", []byte("x")); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("upload to unknown slot: status %d", resp.StatusCode)
 	}
-	id, _, _ := tr.NewUploadSlot()
+	id, _, _ := tr.NewUploadSlot("")
 	if resp := postFile(t, srv.URL+"/upload/"+id, "big.bin", make([]byte, 2000)); resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized upload: status %d, want 413", resp.StatusCode)
 	}
-	if _, err := tr.TakeUpload(id); !errors.Is(err, ErrNotUploaded) {
+	if _, err := tr.TakeUpload("", id); !errors.Is(err, ErrNotUploaded) {
 		t.Errorf("an oversized upload filled the slot (err=%v)", err)
 	}
 }
@@ -339,7 +339,7 @@ func TestDownloadLinkForcesASaveAndNeverRendersTheFile(t *testing.T) {
 	// address it must never be rendered as a page, or a hostile HTML file
 	// could act with the owner's sign-in.
 	tr, srv := transfersServer(t)
-	id, _, _ := tr.OfferDownload(Blob{Filename: `evil".html`, ContentType: "text/html", Data: []byte("<script>alert(1)</script>")})
+	id, _, _ := tr.OfferDownload("", Blob{Filename: `evil".html`, ContentType: "text/html", Data: []byte("<script>alert(1)</script>")})
 
 	resp, err := http.Get(srv.URL + "/media/" + id)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -369,7 +369,7 @@ func TestDownloadLinkForcesASaveAndNeverRendersTheFile(t *testing.T) {
 // fetching it. That probe must not use up the one-time download.
 func TestAHeadRequestDoesNotUseUpTheDownload(t *testing.T) {
 	tr, srv := transfersServer(t)
-	id, _, _ := tr.OfferDownload(Blob{Filename: "clip.mp4", Data: []byte("video")})
+	id, _, _ := tr.OfferDownload("", Blob{Filename: "clip.mp4", Data: []byte("video")})
 
 	head, err := http.Head(srv.URL + "/media/" + id)
 	if err != nil {
@@ -395,7 +395,7 @@ func TestAHeadRequestDoesNotUseUpTheDownload(t *testing.T) {
 
 func TestIdleTransfersReleaseBytesAtExpiry(t *testing.T) {
 	transfers := NewTransfers("https://example.test", 100, 200, 10*time.Millisecond)
-	if _, _, err := transfers.OfferDownload(Blob{Data: []byte("test")}); err != nil {
+	if _, _, err := transfers.OfferDownload("", Blob{Data: []byte("test")}); err != nil {
 		t.Fatal(err)
 	}
 	go transfers.Run(t.Context())

@@ -204,8 +204,14 @@ var (
 
 // signIn runs registration, consent and the code exchange, ticking scopes.
 func (d *signInDaemon) signIn(scopes ...string) string {
+	return d.connect("e2e client", e2eCallback, scopes...).Access
+}
+
+type credentials struct{ Access, Refresh, Client string }
+
+func (d *signInDaemon) connect(name, callback string, scopes ...string) credentials {
 	d.t.Helper()
-	regBody, _ := json.Marshal(map[string]any{"client_name": "e2e client", "redirect_uris": []string{e2eCallback}})
+	regBody, _ := json.Marshal(map[string]any{"client_name": name, "redirect_uris": []string{callback}})
 	req, _ := http.NewRequest(http.MethodPost, d.base+"/register", bytes.NewReader(regBody))
 	req.Header.Set("Content-Type", "application/json")
 	resp, raw := d.do(req)
@@ -217,7 +223,7 @@ func (d *signInDaemon) signIn(scopes ...string) string {
 
 	sum := sha256.Sum256([]byte(e2eVerifier))
 	q := url.Values{
-		"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {e2eCallback},
+		"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {callback},
 		"code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"},
 		"state": {"e2e"}, "scope": {"whatsapp.read whatsapp.send whatsapp.manage"}, "resource": {d.base + "/mcp"},
 	}
@@ -233,12 +239,12 @@ func (d *signInDaemon) signIn(scopes ...string) string {
 		d.t.Fatalf("approve: %d %s", resp.StatusCode, body)
 	}
 	resp, raw = d.postForm("/token", url.Values{"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")},
-		"client_id": {clientID}, "redirect_uri": {e2eCallback}, "code_verifier": {e2eVerifier}})
+		"client_id": {clientID}, "redirect_uri": {callback}, "code_verifier": {e2eVerifier}})
 	var tok map[string]any
 	if resp.StatusCode != http.StatusOK || json.Unmarshal([]byte(raw), &tok) != nil {
 		d.t.Fatalf("token: %d %s", resp.StatusCode, raw)
 	}
-	return fmt.Sprint(tok["access_token"])
+	return credentials{fmt.Sprint(tok["access_token"]), fmt.Sprint(tok["refresh_token"]), clientID}
 }
 
 func (d *signInDaemon) waitForLog(substr string, count int, within time.Duration) {
@@ -318,7 +324,14 @@ func TestPassphraseSignInEndToEnd(t *testing.T) {
 	// The upload is accepted by send_file (it gets as far as needing WhatsApp,
 	// which this test instance is not linked to) and is then spent.
 	_, sendReply, _ := d.call(sendToken, "send_file", map[string]any{"recipient": "15550009999", "upload_id": link.UploadID})
-	if text := toolText(sendReply); !strings.Contains(text, "Not connected to WhatsApp") {
+	var draft struct {
+		ID string `json:"draft_id"`
+	}
+	if err := json.Unmarshal([]byte(toolText(sendReply)), &draft); err != nil || draft.ID == "" {
+		t.Fatal("hosted send did not create a draft")
+	}
+	_, confirmed, _ := d.call(sendToken, "confirm_send", map[string]any{"draft_id": draft.ID})
+	if text := toolText(confirmed); !strings.Contains(text, "Not connected to WhatsApp") {
 		t.Fatalf("send_file with an uploaded file: %s", text)
 	}
 	_, again, _ := d.call(sendToken, "send_file", map[string]any{"recipient": "15550009999", "upload_id": link.UploadID})
@@ -378,5 +391,86 @@ func TestKeyInEnvironmentModeRefusesRemoteBinding(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "WHATSAPP_MCP_VAULT_KEY") || !strings.Contains(string(out), "local use only") {
 		t.Fatalf("refusal does not explain itself:\n%s", out)
+	}
+}
+
+func (d *signInDaemon) refresh(c credentials) (credentials, int) {
+	resp, body := d.postForm("/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {c.Refresh}, "client_id": {c.Client}, "resource": {d.base + "/mcp"}})
+	var pair struct {
+		Access  string `json:"access_token"`
+		Refresh string `json:"refresh_token"`
+	}
+	if resp.StatusCode == 200 {
+		if err := json.Unmarshal([]byte(body), &pair); err != nil || pair.Access == "" || pair.Refresh == "" {
+			d.t.Fatal("invalid refreshed credentials")
+		}
+	}
+	return credentials{pair.Access, pair.Refresh, c.Client}, resp.StatusCode
+}
+
+func TestTwoAssistantsHaveIndependentConnections(t *testing.T) {
+	d := startSignInDaemon(t, "2m")
+	resp, _ := d.postForm("/setup", url.Values{"action": {"init"}, "setup_token": {e2eSetupToken}, "passphrase": {e2ePassphrase}, "confirm": {e2ePassphrase}})
+	if resp.StatusCode != 200 {
+		t.Fatal(resp.StatusCode)
+	}
+	chatgpt := d.connect("ChatGPT", "https://chatgpt.com/connector_platform_oauth_redirect", "whatsapp.read", "whatsapp.send")
+	claude := d.connect("Claude", "https://claude.ai/api/mcp/auth_callback", "whatsapp.read", "whatsapp.send")
+	_, reply, _ := d.call(chatgpt.Access, "send_message", map[string]any{"recipient": "15550001234", "message": "synthetic draft"})
+	var draft struct {
+		ID string `json:"draft_id"`
+	}
+	if json.Unmarshal([]byte(toolText(reply)), &draft) != nil || draft.ID == "" {
+		t.Fatal("missing draft")
+	}
+	_, reply, _ = d.call(claude.Access, "confirm_send", map[string]any{"draft_id": draft.ID})
+	if !strings.Contains(toolText(reply), "no such draft") {
+		t.Fatal("another grant could confirm the draft")
+	}
+	var code int
+	chatgpt, code = d.refresh(chatgpt)
+	if code != 200 {
+		t.Fatal("ChatGPT refresh failed")
+	}
+	_, reply, _ = d.call(chatgpt.Access, "confirm_send", map[string]any{"draft_id": draft.ID})
+	if !strings.Contains(strings.ToLower(toolText(reply)), "not connected") {
+		t.Fatal("refreshed grant lost its draft")
+	}
+	_, out, _ := d.call(chatgpt.Access, "create_upload_link", nil)
+	var link struct {
+		URL string `json:"upload_url"`
+		ID  string `json:"upload_id"`
+	}
+	if json.Unmarshal([]byte(toolText(out)), &link) != nil || link.ID == "" {
+		t.Fatal("missing upload")
+	}
+	_, out, _ = d.call(claude.Access, "send_file", map[string]any{"recipient": "15550001234", "upload_id": link.ID})
+	if !strings.Contains(toolText(out), "no such upload") {
+		t.Fatal("upload was visible across grants")
+	}
+	req, _ := http.NewRequest("GET", d.base+"/setup", nil)
+	_, owner := d.do(req)
+	match := regexp.MustCompile(`name="family" value="([^"]+)">\s*<strong>ChatGPT</strong>`).FindStringSubmatch(owner)
+	if match == nil || !strings.Contains(owner, "<strong>Claude</strong>") {
+		t.Fatal("connections missing from owner page")
+	}
+	resp, _ = d.postForm("/setup", url.Values{"action": {"disconnect"}, "family": {match[1]}})
+	if resp.StatusCode != 200 {
+		t.Fatal("disconnect failed")
+	}
+	if status, _, _ := d.rpc(chatgpt.Access, "tools/list"); status != 401 {
+		t.Fatal("disconnected access still works")
+	}
+	if _, status := d.refresh(chatgpt); status != 400 {
+		t.Fatal("disconnected refresh still works")
+	}
+	req, _ = http.NewRequest("GET", link.URL, nil)
+	resp, _ = d.do(req)
+	if resp.StatusCode != 404 {
+		t.Fatal("disconnected upload still available")
+	}
+	claude, code = d.refresh(claude)
+	if code != 200 || !d.toolNames(claude.Access)["send_message"] {
+		t.Fatal("disconnect affected Claude")
 	}
 }

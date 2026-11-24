@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/sealjay/mcp-whatsapp/internal/client"
+	"github.com/sealjay/mcp-whatsapp/internal/oauth"
 )
 
 // registerMessageTools wires message-mutation and history tools:
@@ -250,6 +250,6 @@ func (s *Server) registerDownloadMedia() {
 			return mcp.NewToolResultError("message_id and chat_jid are required"), nil
 		}
 		r := s.client.DownloadWithMediaRetry(ctx, a.MessageID, a.ChatJID)
-		return downloadMediaResult(r, mediaURI(a.ChatJID, a.MessageID), s.files)
+		return downloadMediaResult(oauth.GrantFamily(ctx), r, mediaURI(a.ChatJID, a.MessageID), s.files)
 	}))
 }

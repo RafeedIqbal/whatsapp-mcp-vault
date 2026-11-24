@@ -60,8 +60,9 @@ type Config[R Runtime] struct {
 	// SecureCookies marks the owner cookie Secure (set when served over https).
 	SecureCookies bool
 	OwnerIdle     time.Duration
-	// RevokeAll ends every app's sign-in (oauth.Store.RevokeAll).
-	RevokeAll func(ctx context.Context) error
+	Grants        *oauth.Store
+	// Discard clears pending work for a revoked family, or all families for an empty ID.
+	Discard func(string)
 	// Extra mounts further always-available routes (the one-time upload page
 	// and download links). They are served without a sign-in and without
 	// unlocking the instance. Optional.
@@ -77,6 +78,7 @@ type Config[R Runtime] struct {
 type Gateway[R Runtime] struct {
 	cfg Config[R]
 
+	grantMu       sync.RWMutex
 	mu            sync.Mutex
 	owners        map[string]*ownerSession
 	setupFailures int
@@ -133,6 +135,8 @@ func (g *Gateway[R]) Handler() http.Handler {
 // --- tools -----------------------------------------------------------------
 
 func (g *Gateway[R]) handleTools(w http.ResponseWriter, r *http.Request) {
+	g.grantMu.RLock()
+	defer g.grantMu.RUnlock()
 	grant, key, err := g.cfg.OAuth.Authenticate(r)
 	if err != nil {
 		g.cfg.OAuth.WriteUnauthorized(w)
@@ -145,7 +149,7 @@ func (g *Gateway[R]) handleTools(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	r.Body = http.MaxBytesReader(w, r.Body, maxToolRequestBytes)
-	rt.MCP(grant.Scope).ServeHTTP(w, r)
+	rt.MCP(grant.Scope).ServeHTTP(w, r.WithContext(oauth.WithGrant(r.Context(), grant)))
 }
 
 // unavailable reports that the instance could not be unlocked. The cause is
@@ -318,33 +322,35 @@ func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 // --- setup -----------------------------------------------------------------
 
 type setupView struct {
-	Mode     string // "init", "login", "recover", "owner", "recovery", "disabled"
-	Error    string
-	Notice   string
-	Recovery string
+	Endpoint    string
+	Connections []oauth.Connection
+	Mode        string // "init", "login", "recover", "owner", "recovery", "disabled"
+	Error       string
+	Notice      string
+	Recovery    string
 }
 
 func (g *Gateway[R]) handleSetupPage(w http.ResponseWriter, r *http.Request) {
 	initialised, err := g.cfg.Meta.Initialized(r.Context())
 	if err != nil {
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "disabled", Error: "The server's state could not be read."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "disabled", Error: "The server's state could not be read."})
 		return
 	}
 	switch {
 	case !initialised && g.cfg.SetupToken == "":
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "disabled"})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "disabled"})
 	case !initialised:
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "init"})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "init"})
 	default:
 		if _, ok := g.ownerKey(r); ok {
-			g.renderSetup(w, http.StatusOK, setupView{Mode: "owner"})
+			g.renderSetup(r, w, http.StatusOK, setupView{Mode: "owner"})
 			return
 		}
 		if r.URL.Query().Has("recover") {
-			g.renderSetup(w, http.StatusOK, setupView{Mode: "recover"})
+			g.renderSetup(r, w, http.StatusOK, setupView{Mode: "recover"})
 			return
 		}
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "login"})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "login"})
 	}
 }
 
@@ -355,7 +361,7 @@ func (g *Gateway[R]) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "login", Error: "The form could not be read."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "login", Error: "The form could not be read."})
 		return
 	}
 	switch r.PostForm.Get("action") {
@@ -367,8 +373,8 @@ func (g *Gateway[R]) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		g.handleRecover(w, r)
 	case "change":
 		g.handleChangePassphrase(w, r)
-	case "revoke":
-		g.handleRevokeAll(w, r)
+	case "revoke", "disconnect":
+		g.handleRevoke(w, r)
 	case "lock":
 		g.handleLockNow(w, r)
 	case "logout":
@@ -383,47 +389,47 @@ func (g *Gateway[R]) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway[R]) handleInit(w http.ResponseWriter, r *http.Request) {
 	// No configured code means nobody may claim the instance, however they ask.
 	if g.cfg.SetupToken == "" {
-		g.renderSetup(w, http.StatusForbidden, setupView{Mode: "disabled"})
+		g.renderSetup(r, w, http.StatusForbidden, setupView{Mode: "disabled"})
 		return
 	}
 	if !g.setupAttemptAllowed() {
-		g.renderSetup(w, http.StatusTooManyRequests, setupView{Mode: "init", Error: "Too many wrong setup codes. Try again in an hour."})
+		g.renderSetup(r, w, http.StatusTooManyRequests, setupView{Mode: "init", Error: "Too many wrong setup codes. Try again in an hour."})
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(r.PostForm.Get("setup_token")), []byte(g.cfg.SetupToken)) != 1 {
 		g.recordSetupFailure()
-		g.renderSetup(w, http.StatusForbidden, setupView{Mode: "init", Error: "That setup code is not right."})
+		g.renderSetup(r, w, http.StatusForbidden, setupView{Mode: "init", Error: "That setup code is not right."})
 		return
 	}
 	if ok, err := g.cfg.Meta.Initialized(r.Context()); err != nil {
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "disabled", Error: "The server's state could not be read."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "disabled", Error: "The server's state could not be read."})
 		return
 	} else if ok {
-		g.renderSetup(w, http.StatusConflict, setupView{Mode: "login", Error: "This server is already set up. Sign in with the passphrase."})
+		g.renderSetup(r, w, http.StatusConflict, setupView{Mode: "login", Error: "This server is already set up. Sign in with the passphrase."})
 		return
 	}
 	pass := r.PostForm.Get("passphrase")
 	if pass != r.PostForm.Get("confirm") {
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "init", Error: "The two passphrases do not match."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "init", Error: "The two passphrases do not match."})
 		return
 	}
 	key, recovery, err := g.cfg.Meta.Initialize(r.Context(), pass)
 	switch {
 	case errors.Is(err, vault.ErrWeakPassphrase):
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "init", Error: "Choose a passphrase of at least 12 characters."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "init", Error: "Choose a passphrase of at least 12 characters."})
 		return
 	case errors.Is(err, vault.ErrAlreadyInitialized):
-		g.renderSetup(w, http.StatusConflict, setupView{Mode: "login", Error: "This server is already set up. Sign in with the passphrase."})
+		g.renderSetup(r, w, http.StatusConflict, setupView{Mode: "login", Error: "This server is already set up. Sign in with the passphrase."})
 		return
 	case err != nil:
 		g.cfg.Logf("gateway: setup failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "init", Error: "Setup failed because of a server error. Nothing was created."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "init", Error: "Setup failed because of a server error. Nothing was created."})
 		return
 	}
 	if err := g.signOwnerIn(w, key); err != nil {
 		g.cfg.Logf("gateway: owner sign-in after setup failed: %v", err)
 	}
-	g.renderSetup(w, http.StatusOK, setupView{Mode: "recovery", Recovery: recovery})
+	g.renderSetup(r, w, http.StatusOK, setupView{Mode: "recovery", Recovery: recovery})
 }
 
 func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -435,21 +441,21 @@ func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 	case errors.Is(err, vault.ErrWrongSecret):
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "login", Error: "Wrong passphrase. Please try again."})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "login", Error: "Wrong passphrase. Please try again."})
 		return
 	case errors.As(err, &locked):
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "login", Error: "Too many wrong attempts. Passphrase sign-in is paused until " + locked.Until.UTC().Format("15:04 UTC") + ". Your recovery code still works."})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "login", Error: "Too many wrong attempts. Passphrase sign-in is paused until " + locked.Until.UTC().Format("15:04 UTC") + ". Your recovery code still works."})
 		return
 	case errors.Is(err, vault.ErrNotInitialized):
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	default:
 		g.cfg.Logf("gateway: owner sign-in failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "login", Error: "Sign-in failed because of a server error."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "login", Error: "Sign-in failed because of a server error."})
 		return
 	}
 	if err := g.signOwnerIn(w, key); err != nil {
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "login", Error: "Sign-in failed because of a server error."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "login", Error: "Sign-in failed because of a server error."})
 		return
 	}
 	http.Redirect(w, r, "/pair", http.StatusSeeOther)
@@ -460,34 +466,34 @@ func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway[R]) handleRecover(w http.ResponseWriter, r *http.Request) {
 	pass := r.PostForm.Get("passphrase")
 	if pass != r.PostForm.Get("confirm") {
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "recover", Error: "The two passphrases do not match."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "recover", Error: "The two passphrases do not match."})
 		return
 	}
 	key, err := g.cfg.Meta.UnlockWithRecoveryCode(r.Context(), r.PostForm.Get("recovery_code"))
 	switch {
 	case err == nil:
 	case errors.Is(err, vault.ErrWrongSecret):
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "recover", Error: "That recovery code is not right."})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "recover", Error: "That recovery code is not right."})
 		return
 	case errors.Is(err, vault.ErrNotInitialized):
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	default:
 		g.cfg.Logf("gateway: recovery failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "Recovery failed because of a server error."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "Recovery failed because of a server error."})
 		return
 	}
 	switch err := g.cfg.Meta.ChangePassphrase(r.Context(), key, pass); {
 	case errors.Is(err, vault.ErrWeakPassphrase):
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "recover", Error: "Choose a passphrase of at least 12 characters."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "recover", Error: "Choose a passphrase of at least 12 characters."})
 		return
 	case err != nil:
 		g.cfg.Logf("gateway: setting a new passphrase failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "The new passphrase could not be saved."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "The new passphrase could not be saved."})
 		return
 	}
 	if err := g.signOwnerIn(w, key); err != nil {
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "login", Notice: "Your passphrase was changed. Sign in with it."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "login", Notice: "Your passphrase was changed. Sign in with it."})
 		return
 	}
 	http.Redirect(w, r, "/setup", http.StatusSeeOther)
@@ -510,36 +516,51 @@ func (g *Gateway[R]) handleChangePassphrase(w http.ResponseWriter, r *http.Reque
 	}
 	pass := r.PostForm.Get("passphrase")
 	if pass != r.PostForm.Get("confirm") {
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "owner", Error: "The two passphrases do not match."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "owner", Error: "The two passphrases do not match."})
 		return
 	}
 	switch err := g.cfg.Meta.ChangePassphrase(r.Context(), key, pass); {
 	case errors.Is(err, vault.ErrWeakPassphrase):
-		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "owner", Error: "Choose a passphrase of at least 12 characters."})
+		g.renderSetup(r, w, http.StatusBadRequest, setupView{Mode: "owner", Error: "Choose a passphrase of at least 12 characters."})
 	case err != nil:
 		g.cfg.Logf("gateway: changing the passphrase failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The new passphrase could not be saved."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The new passphrase could not be saved."})
 	default:
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "owner", Notice: "Passphrase changed. Apps that are already connected stay connected."})
+		g.renderSetup(r, w, http.StatusOK, setupView{Mode: "owner", Notice: "Passphrase changed. Apps that are already connected stay connected."})
 	}
 }
 
 // handleRevokeAll signs every connected app out. Each has to be approved
 // again with the passphrase.
-func (g *Gateway[R]) handleRevokeAll(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway[R]) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	if _, ok := g.requireOwner(w, r); !ok {
 		return
 	}
-	if g.cfg.RevokeAll == nil {
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "Signing apps out is not available on this server."})
-		return
+	g.grantMu.Lock()
+	defer g.grantMu.Unlock()
+	family := ""
+	notice := "Every app has been signed out. Connect them again to approve them with your passphrase."
+	var err error
+	if r.PostForm.Get("action") == "disconnect" {
+		family = r.PostForm.Get("family")
+		if family == "" {
+			http.Error(w, "Select a connection.", http.StatusBadRequest)
+			return
+		}
+		err = g.cfg.Grants.RevokeConnection(r.Context(), family)
+		notice = "This connection has been signed out."
+	} else {
+		err = g.cfg.Grants.RevokeAll(r.Context())
 	}
-	if err := g.cfg.RevokeAll(r.Context()); err != nil {
+	if err != nil && !errors.Is(err, oauth.ErrInvalidGrant) {
 		g.cfg.Logf("gateway: revoking sign-ins failed: %v", err)
-		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The apps could not be signed out."})
+		g.renderSetup(r, w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The sign-in could not be revoked."})
 		return
 	}
-	g.renderSetup(w, http.StatusOK, setupView{Mode: "owner", Notice: "Every app has been signed out. Connect them again to approve them with your passphrase."})
+	if g.cfg.Discard != nil {
+		g.cfg.Discard(family)
+	}
+	g.renderSetup(r, w, http.StatusOK, setupView{Mode: "owner", Notice: notice})
 }
 
 // handleLockNow locks the instance immediately and ends every owner sign-in.
@@ -568,7 +589,16 @@ func (g *Gateway[R]) recordSetupFailure() {
 	g.mu.Unlock()
 }
 
-func (g *Gateway[R]) renderSetup(w http.ResponseWriter, status int, v setupView) {
+func (g *Gateway[R]) renderSetup(r *http.Request, w http.ResponseWriter, status int, v setupView) {
+	if v.Mode == "owner" {
+		v.Endpoint = g.cfg.OAuth.Resource()
+		var err error
+		v.Connections, err = g.cfg.Grants.Connections(r.Context())
+		if err != nil {
+			v.Error = "The connected apps could not be loaded."
+			status = http.StatusInternalServerError
+		}
+	}
 	oauth.PageHeaders(w, "")
 	w.WriteHeader(status)
 	_ = setupTemplate.Execute(w, v)
@@ -630,7 +660,13 @@ a.button{display:inline-block;text-decoration:none;font-size:1rem;padding:.6rem 
 </form>
 {{else if eq .Mode "owner"}}
 <h1>You are signed in</h1>
-<p class="who">This connector is set up. To use it from Claude, add this server's address as a custom connector there.</p>
+<h2>Connected apps</h2>
+<p>Add this URL in ChatGPT or Claude and choose OAuth sign-in.</p>
+<p><code>{{.Endpoint}}</code></p>
+{{range .Connections}}<form method="post" action="/setup">
+<input type="hidden" name="action" value="disconnect"><input type="hidden" name="family" value="{{.FamilyID}}">
+<strong>{{.Name}}</strong> <small>{{.Scope}}</small> <button type="submit">Disconnect</button></form>
+{{else}}<p>No apps connected.</p>{{end}}
 <p><a class="button" href="/pair">Link or re-link WhatsApp</a></p>
 <hr>
 <form method="post" action="/setup" autocomplete="off">

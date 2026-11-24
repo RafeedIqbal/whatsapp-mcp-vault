@@ -83,7 +83,7 @@ func newFixture(t *testing.T, opts ...fixtureOpt) *fixture {
 	cfg := Config[*fakeRuntime]{
 		Meta:       meta,
 		OAuth:      oauth.NewServer(oauth.Config{Issuer: testIssuer, Store: f.store, Unlock: meta.Unlock}),
-		RevokeAll:  f.store.RevokeAll,
+		Grants:     f.store,
 		Sessions:   f.sessions,
 		SetupToken: testSetupToken,
 		Now:        func() time.Time { return f.now },
