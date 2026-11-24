@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -42,22 +41,18 @@ func (s *Server) registerResources() {
 
 // handleMediaResource is the resources/read handler for the whatsapp://
 // scheme. It parses the URI, invokes the same Download path the tool uses
-// (which is idempotent — cache hits are fast, cache misses trigger the
-// actual CDN fetch), then returns the decrypted bytes as a
-// BlobResourceContents with a sniffed MIME type.
+// (every read fetches from WhatsApp; nothing is cached on disk), then returns
+// the decrypted bytes as a BlobResourceContents with a sniffed MIME type.
 func (s *Server) handleMediaResource(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	chatJID, messageID, err := parseMediaURI(req.Params.URI)
 	if err != nil {
 		return nil, fmt.Errorf("invalid whatsapp media URI %q: %w", req.Params.URI, err)
 	}
-	r := s.client.DownloadWithMediaRetry(ctx, messageID, chatJID, "")
+	r := s.client.DownloadWithMediaRetry(ctx, messageID, chatJID)
 	if !r.Success {
 		return nil, fmt.Errorf("download media for %s/%s: %s", chatJID, messageID, r.Message)
 	}
-	data, err := os.ReadFile(r.Path)
-	if err != nil {
-		return nil, fmt.Errorf("read decrypted media at %s: %w", r.Path, err)
-	}
+	data := r.Data
 	return []mcp.ResourceContents{
 		mcp.BlobResourceContents{
 			URI:      req.Params.URI,
@@ -102,4 +97,10 @@ func sniffResourceMIME(data []byte, mediaType string) string {
 		return "audio/ogg"
 	}
 	return mime
+}
+
+// mediaURI is the `whatsapp://media/{chat_jid}/{message_id}` address of a
+// message's media, the inverse of parseMediaURI.
+func mediaURI(chatJID, messageID string) string {
+	return "whatsapp://media/" + url.PathEscape(chatJID) + "/" + url.PathEscape(messageID)
 }

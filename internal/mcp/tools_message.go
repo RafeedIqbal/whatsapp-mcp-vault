@@ -231,17 +231,15 @@ func (s *Server) registerRequestSync() {
 // -- download_media ---------------------------------------------------------
 
 type downloadMediaArgs struct {
-	MessageID  string `json:"message_id"`
-	ChatJID    string `json:"chat_jid"`
-	OutputPath string `json:"output_path"`
+	MessageID string `json:"message_id"`
+	ChatJID   string `json:"chat_jid"`
 }
 
 func (s *Server) registerDownloadMedia() {
 	tool := mcp.NewTool("download_media",
-		mcp.WithDescription("Fetch the encrypted media payload (image, video, audio, document) for a previously-cached message, decrypt it, and write it to a local file under the store directory; returns the absolute path. For image and audio downloads at most 5 MiB, the decrypted bytes are ALSO embedded in the tool result as an ImageContent or AudioContent block so remote MCP clients can view or hear the payload without accessing the daemon's filesystem. Videos and documents are not embedded (too large or not renderable inline). Optionally also writes the decrypted file to `output_path`, which must live under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`). If WhatsApp's CDN refuses the stored media link (HTTP 403/404/410, typical for media from history sync, whose signed links expire), the daemon asks the account's own phone once to re-upload the file, waits up to 30 seconds for its answer, downloads once more, validates the payload against the cached size and SHA-256, and only then stores the verified link; the phone must be online, and if it no longer has the file the call fails saying so. Recovery also works in read-only mode: the request goes only to the account's own phone, and no notification is sent to the sender or chat. Idempotent — repeated calls for the same message return the cached file path. Prerequisite: the message must contain media; use list_messages to find media message IDs. Returns a JSON object `{Success, Message, MediaType, Filename, Path}` as the first content block, followed by an optional ImageContent/AudioContent block for renderable media."),
+		mcp.WithDescription("Fetch the encrypted media payload (image, video, audio, document) for a previously-cached message, decrypt it in memory and return it in the tool result: images and audio as an image or audio content block, videos and documents as an embedded resource. Nothing is written to disk and the media is fetched again on every call. Media over 5 MiB is not returned; the result then says so. If WhatsApp's CDN refuses the stored media link (HTTP 403/404/410, typical for media from history sync, whose signed links expire), the daemon asks the account's own phone once to re-upload the file, waits up to 30 seconds for its answer, downloads once more, validates the payload against the cached size and SHA-256, and only then stores the verified link; the phone must be online, and if it no longer has the file the call fails saying so. Recovery also works in read-only mode: the request goes only to the account's own phone, and no notification is sent to the sender or chat. Idempotent — repeated calls for the same message return the cached file path. Prerequisite: the message must contain media; use list_messages to find media message IDs. Returns a JSON object `{Success, Message, MediaType, Filename, Path}` as the first content block, followed by an optional ImageContent/AudioContent block for renderable media."),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of a media message (use `message_id` from list_messages)")),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
-		mcp.WithString("output_path", mcp.Description("optional absolute path under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`); parent directory must exist; an existing file is left untouched and the call succeeds only if it already holds identical media, otherwise it fails; omit to write only to the daemon cache")),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -251,7 +249,7 @@ func (s *Server) registerDownloadMedia() {
 		if a.MessageID == "" || a.ChatJID == "" {
 			return mcp.NewToolResultError("message_id and chat_jid are required"), nil
 		}
-		r := s.client.DownloadWithMediaRetry(ctx, a.MessageID, a.ChatJID, a.OutputPath)
-		return downloadMediaResult(r)
+		r := s.client.DownloadWithMediaRetry(ctx, a.MessageID, a.ChatJID)
+		return downloadMediaResult(r, mediaURI(a.ChatJID, a.MessageID))
 	}))
 }

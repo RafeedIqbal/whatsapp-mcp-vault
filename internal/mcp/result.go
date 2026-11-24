@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -20,65 +19,61 @@ func resultJSON(v any) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(string(b)), nil
 }
 
-// inlineMediaMaxBytes is the size cap for embedding decrypted media bytes
-// directly in a download_media tool result. Anything larger stays reachable
-// through the returned Path but is not embedded so we don't blow up the
-// LLM context (or the transport frame).
+// inlineMediaMaxBytes is the size cap for returning decrypted media in a
+// download_media tool result. Media is never written to disk, so the result
+// is the only way it leaves the server; anything larger is refused with an
+// explanation rather than blowing up the model's context or the transport.
 const inlineMediaMaxBytes = 5 * 1024 * 1024
 
+// mediaSummary is the JSON block that leads every download_media result. It
+// describes the media; it carries neither the bytes nor any server path.
+type mediaSummary struct {
+	client.DownloadResult
+	Note string `json:"note,omitempty"`
+}
+
 // downloadMediaResult builds the CallToolResult returned by the download_media
-// tool. The first content block is always the JSON summary (backwards
-// compatible with callers that read content[0].text). For successful image
-// or audio downloads whose file is at most inlineMediaMaxBytes, a second
-// ImageContent / AudioContent block is appended with the base64-encoded
-// bytes so remote MCP clients can view the payload without SCPing from the
-// daemon host.
-//
-// Videos and documents are not embedded (too large or not renderable inline).
-// If the file is missing or oversized, the call still succeeds with just the
-// JSON block — the tool is still useful and the caller can fetch the file
-// out of band via Path.
-func downloadMediaResult(r client.DownloadResult) (*mcp.CallToolResult, error) {
-	b, err := json.MarshalIndent(r, "", "  ")
+// tool. The first content block is always the JSON summary. For a successful
+// download of at most inlineMediaMaxBytes the bytes follow in a second block:
+// an ImageContent or AudioContent for images and audio, and an embedded
+// resource (addressed by uri) for videos and documents, which have no content
+// type of their own.
+func downloadMediaResult(r client.DownloadResult, uri string) (*mcp.CallToolResult, error) {
+	sum := mediaSummary{DownloadResult: r}
+	var media mcp.Content
+	if r.Success && len(r.Data) > 0 {
+		if len(r.Data) > inlineMediaMaxBytes {
+			sum.Note = fmt.Sprintf("media is too large to return (%d bytes; the limit is %d)", len(r.Data), inlineMediaMaxBytes)
+		} else {
+			media = inlineMedia(r, uri)
+		}
+	}
+
+	b, err := json.MarshalIndent(sum, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
 	}
 	contents := []mcp.Content{mcp.NewTextContent(string(b))}
-
-	if r.Success && (r.MediaType == "image" || r.MediaType == "audio") && r.Path != "" {
-		if inlined, ok := readInlineMedia(r.Path, r.MediaType); ok {
-			contents = append(contents, inlined)
-		}
+	if media != nil {
+		contents = append(contents, media)
 	}
-
 	return &mcp.CallToolResult{Content: contents}, nil
 }
 
-// readInlineMedia returns an ImageContent or AudioContent block for the file
-// at path, or (nil, false) if the file is missing, unreadable, or larger
-// than inlineMediaMaxBytes. The MIME type is sniffed via sniffResourceMIME
-// (resources.go) so we get the real format regardless of the filename
-// WhatsApp assigns (all photos are named `.jpg` even when the underlying
-// bytes are WebP, and all voice notes are named `.ogg`).
-func readInlineMedia(path, mediaType string) (mcp.Content, bool) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, false
-	}
-	if info.Size() > inlineMediaMaxBytes {
-		return nil, false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-	mimeType := sniffResourceMIME(data, mediaType)
-	encoded := base64.StdEncoding.EncodeToString(data)
-	switch mediaType {
+// inlineMedia wraps decrypted bytes in the content block that suits their
+// kind. The MIME type is sniffed via sniffResourceMIME (resources.go) so we
+// get the real format regardless of the filename WhatsApp assigns (all photos
+// are named `.jpg` even when the underlying bytes are WebP, and all voice
+// notes are named `.ogg`).
+func inlineMedia(r client.DownloadResult, uri string) mcp.Content {
+	mimeType := sniffResourceMIME(r.Data, r.MediaType)
+	encoded := base64.StdEncoding.EncodeToString(r.Data)
+	switch r.MediaType {
 	case "image":
-		return mcp.NewImageContent(encoded, mimeType), true
+		return mcp.NewImageContent(encoded, mimeType)
 	case "audio":
-		return mcp.NewAudioContent(encoded, mimeType), true
+		return mcp.NewAudioContent(encoded, mimeType)
+	default:
+		return mcp.NewEmbeddedResource(mcp.BlobResourceContents{URI: uri, MIMEType: mimeType, Blob: encoded})
 	}
-	return nil, false
 }

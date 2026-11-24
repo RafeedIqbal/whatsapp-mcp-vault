@@ -137,3 +137,31 @@ func TestEventLogs_DebugShowsNames(t *testing.T) {
 	assertLogExcludes(t, logs, logTestDMUser, logTestGroupUser)
 	assertLogIncludes(t, logs, "*****00123@s.whatsapp.net", "*****00042@g.us")
 }
+
+// A hosted instance runs at INFO. At that level, receiving and storing
+// messages must not write a line per message: even with numbers masked and
+// text reduced to a length, that is a record of who was messaged and when.
+func TestStoringMessagesWritesNoPerMessageLinesAtInfo(t *testing.T) {
+	s := newTestStoreWithLIDMap(t, nil)
+	var buf bytes.Buffer
+	c := &Client{
+		store:    s,
+		log:      &stderrLogger{out: &buf, mod: "test", min: logLevelToInt["INFO"]},
+		redactor: &security.Redactor{},
+	}
+	driveNameResolution(t, c)
+	driveDocumentMessage(t, c)
+
+	if got := strings.TrimSpace(buf.String()); got != "" {
+		t.Fatalf("INFO log is not empty after storing two messages:\n%s", got)
+	}
+}
+
+// The detail is still there for troubleshooting at DEBUG.
+func TestStoringMessagesStillTracedAtDebug(t *testing.T) {
+	c, buf := newLogCapturingClient(t, false)
+	driveNameResolution(t, c)
+	driveDocumentMessage(t, c)
+	// Live messages are traced as "[time] <- sender: body", with the sender masked.
+	assertLogIncludes(t, buf.String(), "<- …0123", "Using group name for …0042")
+}

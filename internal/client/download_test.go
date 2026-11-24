@@ -1,298 +1,161 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 	"go.mau.fi/whatsmeow"
 )
 
-// Regression for the path-traversal guard rejecting every JID when the
-// operator runs with a relative -store directory (the default "./store").
-// chatDir used to be built from the relative c.store.Dir() and compared
-// against an absolute storeDir prefix, so HasPrefix never matched and every
-// download returned "invalid chat directory: path escapes store".
-func TestDownload_RelativeStoreDirAcceptsLegitimateJID(t *testing.T) {
-	t.Chdir(t.TempDir())
+const (
+	mediaChat  = "447700000099@s.whatsapp.net"
+	mediaMsgID = "M-MEDIA-1"
+)
 
-	s, err := store.Open("./store")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer s.Close()
-
-	const (
-		msgID   = "AC2B9F53E92DF1FA774645E49A49600E"
-		chatJID = "971527492345@s.whatsapp.net"
-	)
-	if err := s.StoreChat(chatJID, "Sarah", time.Now().UTC()); err != nil {
-		t.Fatalf("seed chat: %v", err)
-	}
-	if err := s.StoreMessage(context.Background(), store.Message{
-		ID:        msgID,
-		ChatJID:   chatJID,
-		Sender:    chatJID,
-		Content:   "see attached",
-		Timestamp: time.Now().UTC(),
-		MediaType: "image",
-		Filename:  "photo.jpg",
-		URL:       "", // empty triggers the incomplete-media guard *after* path validation
-	}, nil, nil, nil, 0); err != nil {
-		t.Fatalf("seed message: %v", err)
-	}
-
-	c := newClientWithStore(t, s)
-	got := c.Download(context.Background(), msgID, chatJID, "")
-
-	if strings.Contains(got.Message, "path escapes store") {
-		t.Fatalf("path guard rejected a legitimate JID with relative store dir: %s", got.Message)
-	}
-	if got.Success {
-		t.Fatalf("expected failure at incomplete-media guard, got success")
-	}
-	if !strings.Contains(got.Message, "incomplete media information") {
-		t.Fatalf("expected 'incomplete media information' error, got: %s", got.Message)
-	}
-
-	// Side-effect: chat directory should have been created under ./store.
-	wantDir := filepath.Join("store", chatJID)
-	info, statErr := os.Stat(wantDir)
-	if statErr != nil {
-		t.Fatalf("chat dir not created at %s: %v", wantDir, statErr)
-	}
-	if !info.IsDir() {
-		t.Fatalf("%s exists but is not a directory", wantDir)
-	}
+// mediaFixture is a store holding one media message plus a client whose
+// network fetch is replaced by a stub that returns served and counts calls.
+type mediaFixture struct {
+	c        *Client
+	storeDir string
+	fetches  int
 }
 
-// The guard must still reject a chatJID that resolves outside the store root
-// (defence-in-depth — chatJID currently comes from the cached DB, not the
-// wire, but the check is cheap and the threat model assumes the DB could be
-// tampered with).
-func TestDownload_RejectsPathTraversalJID(t *testing.T) {
-	t.Chdir(t.TempDir())
-
-	s, err := store.Open("./store")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer s.Close()
-
-	const (
-		msgID   = "M1"
-		chatJID = "../escape@s.whatsapp.net"
-	)
-	if err := s.StoreChat(chatJID, "evil", time.Now().UTC()); err != nil {
-		t.Fatalf("seed chat: %v", err)
-	}
-	if err := s.StoreMessage(context.Background(), store.Message{
-		ID:        msgID,
-		ChatJID:   chatJID,
-		Sender:    chatJID,
-		Content:   "x",
-		Timestamp: time.Now().UTC(),
-		MediaType: "image",
-		Filename:  "x.jpg",
-	}, nil, nil, nil, 0); err != nil {
-		t.Fatalf("seed message: %v", err)
-	}
-
-	c := newClientWithStore(t, s)
-	got := c.Download(context.Background(), msgID, chatJID, "")
-
-	if got.Success {
-		t.Fatalf("expected failure, got success")
-	}
-	if !strings.Contains(got.Message, "path escapes store") {
-		t.Fatalf("expected path-escape rejection, got: %s", got.Message)
-	}
-}
-
-// seedCacheHit pre-creates a media row + a corresponding cache file so
-// Download's cache short-circuit fires deterministically without hitting
-// whatsmeow. Returns the absolute cache path and the configured media root
-// for the test to set up output_path scenarios under.
-func seedCacheHit(t *testing.T, jid, msgID, filename string) (cachePath, mediaRoot string, c *Client) {
+func newMediaFixture(t *testing.T, payload, served []byte, mediaType, filename string, declaredLength uint64) *mediaFixture {
 	t.Helper()
-	t.Chdir(t.TempDir())
-
-	s, err := store.Open("./store")
+	dir := t.TempDir()
+	s, err := store.Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
-
-	if err := s.StoreChat(jid, "test", time.Now().UTC()); err != nil {
-		t.Fatalf("seed chat: %v", err)
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.StoreChat(mediaChat, "test", time.Now().UTC()); err != nil {
+		t.Fatal(err)
 	}
-	payload := []byte("PRETEND-JPEG-BYTES")
 	digest := sha256.Sum256(payload)
 	if err := s.StoreMessage(context.Background(), store.Message{
-		ID:        msgID,
-		ChatJID:   jid,
-		Sender:    jid,
-		Content:   "x",
-		Timestamp: time.Now().UTC(),
-		MediaType: "image",
-		Filename:  filename,
-	}, nil, digest[:], nil, uint64(len(payload))); err != nil {
-		t.Fatalf("seed message: %v", err)
+		ID: mediaMsgID, ChatJID: mediaChat, Sender: mediaChat, Content: "x", Timestamp: time.Now().UTC(),
+		MediaType: mediaType, Filename: filename, URL: "https://example.invalid/media", DirectPath: "/media",
+	}, []byte{1}, digest[:], []byte{2}, declaredLength); err != nil {
+		t.Fatal(err)
 	}
-
-	messageDir := filepath.Join("store", jid, hex.EncodeToString([]byte(msgID)))
-	if err := os.MkdirAll(messageDir, 0o700); err != nil {
-		t.Fatalf("mkdir chatDir: %v", err)
+	f := &mediaFixture{c: newClientWithStore(t, s), storeDir: dir}
+	f.c.downloadMedia = func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error) {
+		f.fetches++
+		return served, nil
 	}
-	cachePath = filepath.Join(messageDir, filename)
-	if err := os.WriteFile(cachePath, payload, 0o600); err != nil {
-		t.Fatalf("seed cache file: %v", err)
-	}
-	cachePathAbs, err := filepath.Abs(cachePath)
-	if err != nil {
-		t.Fatalf("abs cache path: %v", err)
-	}
-
-	mediaRoot = filepath.Join("store", "uploads")
-	if err := os.MkdirAll(mediaRoot, 0o755); err != nil {
-		t.Fatalf("mkdir uploads: %v", err)
-	}
-	mediaRootAbs, err := filepath.Abs(mediaRoot)
-	if err != nil {
-		t.Fatalf("abs media root: %v", err)
-	}
-
-	c = newClientWithStore(t, s)
-	c.allowedMediaRoot = mediaRootAbs
-	return cachePathAbs, mediaRootAbs, c
+	return f
 }
 
-func TestDownload_SameFilenameUsesDistinctMessageCache(t *testing.T) {
-	t.Chdir(t.TempDir())
-	s, err := store.Open("./store")
+// filesUnder lists every path below dir, so a test can prove a call created none.
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		out = append(out, strings.TrimPrefix(p, dir))
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	const jid = "447700000099@s.whatsapp.net"
-	if err := s.StoreChat(jid, "test", time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, tc := range []struct{ id, payload string }{{"M-COLLIDE-1", "FIRST"}, {"M-COLLIDE-2", "SECOND"}} {
-		digest := sha256.Sum256([]byte(tc.payload))
-		if err := s.StoreMessage(context.Background(), store.Message{
-			ID: tc.id, ChatJID: jid, Sender: jid, Content: "x", Timestamp: time.Now().UTC(),
-			MediaType: "document", Filename: "report.pdf", URL: "https://example.invalid/media",
-		}, []byte{1}, digest[:], []byte{2}, uint64(len(tc.payload))); err != nil {
-			t.Fatal(err)
-		}
-		dir := filepath.Join("store", jid, hex.EncodeToString([]byte(tc.id)))
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "report.pdf"), []byte(tc.payload), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	c := newClientWithStore(t, s)
-	first := c.Download(context.Background(), "M-COLLIDE-1", jid, "")
-	second := c.Download(context.Background(), "M-COLLIDE-2", jid, "")
-	if !first.Success || !second.Success {
-		t.Fatalf("downloads failed: first=%+v second=%+v", first, second)
-	}
-	if first.Path == second.Path {
-		t.Fatalf("distinct message IDs shared cache path %q", first.Path)
-	}
-	gotFirst, _ := os.ReadFile(first.Path)
-	gotSecond, _ := os.ReadFile(second.Path)
-	if string(gotFirst) != "FIRST" || string(gotSecond) != "SECOND" {
-		t.Fatalf("wrong cached payloads: %q %q", gotFirst, gotSecond)
-	}
+	sort.Strings(out)
+	return out
 }
 
-func TestDownload_InvalidCacheIsReplacedAfterValidatedDownload(t *testing.T) {
-	t.Chdir(t.TempDir())
-	s, err := store.Open("./store")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	const jid, msgID = "447700000099@s.whatsapp.net", "M-CORRUPT"
-	payload := []byte("VALID-PAYLOAD")
-	digest := sha256.Sum256(payload)
-	if err := s.StoreChat(jid, "test", time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.StoreMessage(context.Background(), store.Message{
-		ID: msgID, ChatJID: jid, Sender: jid, Content: "x", Timestamp: time.Now().UTC(),
-		MediaType: "image", Filename: "photo.jpg", URL: "https://example.invalid/media", DirectPath: "/media",
-	}, []byte{1}, digest[:], []byte{2}, uint64(len(payload))); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join("store", jid, hex.EncodeToString([]byte(msgID)))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cachePath := filepath.Join(dir, "photo.jpg")
-	if err := os.WriteFile(cachePath, []byte("BAD"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestDownloadReturnsTheDecryptedBytes(t *testing.T) {
+	payload := []byte("DECRYPTED-IMAGE-BYTES")
+	f := newMediaFixture(t, payload, payload, "image", "photo.jpg", uint64(len(payload)))
 
-	c := newClientWithStore(t, s)
-	c.downloadMedia = func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error) { return payload, nil }
-	got := c.Download(context.Background(), msgID, jid, "")
+	got := f.c.Download(context.Background(), mediaMsgID, mediaChat)
 	if !got.Success {
-		t.Fatalf("expected redownload success: %+v", got)
+		t.Fatalf("Download failed: %s", got.Message)
 	}
-	onDisk, err := os.ReadFile(cachePath)
-	if err != nil || string(onDisk) != string(payload) {
-		t.Fatalf("cache not replaced: %q err=%v", onDisk, err)
+	if !bytes.Equal(got.Data, payload) {
+		t.Fatalf("Data = %q, want the payload", got.Data)
+	}
+	if got.MediaType != "image" || got.Filename != "photo.jpg" || got.Size != len(payload) {
+		t.Fatalf("metadata = %q %q %d", got.MediaType, got.Filename, got.Size)
 	}
 }
 
-// An unreadable cache entry is logged and ignored. The file-system error names
-// the cache path, which contains the chat JID and the filename, so the
-// non-debug log line keeps only the operation and cause.
-func TestDownload_InvalidCacheLogRedactsPath(t *testing.T) {
-	for _, debug := range []bool{false, true} {
-		c, logs := newLogCapturingClient(t, debug)
-		const msgID = "M-CACHE-DIR"
-		digest := sha256.Sum256([]byte("payload"))
-		if err := c.store.StoreChat(logTestDMJID, logTestDMName, time.Now().UTC()); err != nil {
-			t.Fatal(err)
-		}
-		if err := c.store.StoreMessage(context.Background(), store.Message{
-			ID: msgID, ChatJID: logTestDMJID, Sender: logTestDMJID, Timestamp: time.Now().UTC(),
-			MediaType: "document", Filename: logTestDocName,
-		}, nil, digest[:], nil, 0); err != nil {
-			t.Fatal(err)
-		}
-		// A directory where the cached file should be: stat succeeds, the
-		// SHA-256 check then fails with "read <path>: is a directory".
-		cachePath := filepath.Join(c.store.Dir(), logTestDMJID, hex.EncodeToString([]byte(msgID)), security.SafeFilename(logTestDocName))
-		if err := os.MkdirAll(cachePath, 0o700); err != nil {
-			t.Fatal(err)
-		}
+func TestDownloadWritesNothingToDisk(t *testing.T) {
+	payload := []byte("DECRYPTED-MARKER-51ab-never-on-disk")
+	f := newMediaFixture(t, payload, payload, "document", "report.pdf", uint64(len(payload)))
+	before := filesUnder(t, f.storeDir)
 
-		if got := c.Download(context.Background(), msgID, logTestDMJID, ""); got.Success {
-			t.Fatalf("debug=%v: expected failure at the incomplete-media guard: %+v", debug, got)
+	if got := f.c.DownloadWithMediaRetry(context.Background(), mediaMsgID, mediaChat); !got.Success {
+		t.Fatalf("download failed: %s", got.Message)
+	}
+
+	after := filesUnder(t, f.storeDir)
+	if strings.Join(before, "\n") != strings.Join(after, "\n") {
+		t.Fatalf("download created files:\nbefore: %v\nafter:  %v", before, after)
+	}
+	for _, rel := range after {
+		b, err := os.ReadFile(filepath.Join(f.storeDir, rel))
+		if err != nil {
+			continue // directories
 		}
-		out := logs.String()
-		assertLogIncludes(t, out, "Ignoring invalid cached media", "is a directory")
-		assertLogExcludes(t, out, logTestDMUser)
-		if !debug {
-			assertLogIncludes(t, out, "read [path]: is a directory")
-			assertLogExcludes(t, out, "Alice", hex.EncodeToString([]byte(msgID)))
+		if bytes.Contains(b, payload) {
+			t.Fatalf("%s contains the decrypted media", rel)
 		}
+	}
+}
+
+func TestDownloadKeepsNoCopyBetweenCalls(t *testing.T) {
+	payload := []byte("PAYLOAD")
+	f := newMediaFixture(t, payload, payload, "image", "photo.jpg", uint64(len(payload)))
+	f.c.Download(context.Background(), mediaMsgID, mediaChat)
+	f.c.Download(context.Background(), mediaMsgID, mediaChat)
+	if f.fetches != 2 {
+		t.Fatalf("fetched %d times for 2 calls: a copy was kept somewhere", f.fetches)
+	}
+}
+
+func TestDownloadRejectsBytesThatDoNotMatchTheMessage(t *testing.T) {
+	payload := []byte("EXPECTED")
+	f := newMediaFixture(t, payload, []byte("TAMPERED"), "image", "photo.jpg", uint64(len(payload)))
+	got := f.c.Download(context.Background(), mediaMsgID, mediaChat)
+	if got.Success || got.Data != nil {
+		t.Fatalf("mismatched payload accepted: %+v", got)
+	}
+}
+
+func TestDownloadRefusesMediaTooLargeToHoldInMemory(t *testing.T) {
+	payload := []byte("x")
+	f := newMediaFixture(t, payload, payload, "video", "clip.mp4", maxMediaBytes+1)
+	got := f.c.Download(context.Background(), mediaMsgID, mediaChat)
+	if got.Success {
+		t.Fatal("oversized media accepted")
+	}
+	if !strings.Contains(got.Message, "limit") {
+		t.Fatalf("message does not explain the limit: %q", got.Message)
+	}
+	if f.fetches != 0 {
+		t.Fatalf("oversized media was fetched %d times before being refused", f.fetches)
+	}
+}
+
+func TestDownloadRejectsMessagesWithoutMedia(t *testing.T) {
+	f := newMediaFixture(t, []byte("x"), []byte("x"), "", "", 1)
+	got := f.c.Download(context.Background(), mediaMsgID, mediaChat)
+	if got.Success || !strings.Contains(got.Message, "not a media message") {
+		t.Fatalf("got %+v", got)
+	}
+	if got := f.c.Download(context.Background(), "NO-SUCH-ID", mediaChat); got.Success {
+		t.Fatalf("unknown message succeeded: %+v", got)
 	}
 }
 
@@ -314,166 +177,5 @@ func TestValidateMediaPayloadRejectsWrongHashAndLength(t *testing.T) {
 	wrong := sha256.Sum256([]byte("other"))
 	if err := validateMediaPayload(payload, uint64(len(payload)), wrong[:]); err == nil {
 		t.Fatal("wrong hash accepted")
-	}
-}
-
-// Happy path: output_path under the media root materialises the cached file
-// at the requested destination and returns it in Path.
-func TestDownload_OutputPathHappyPath(t *testing.T) {
-	cachePath, mediaRoot, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-1", "p.jpg")
-	outPath := filepath.Join(mediaRoot, "received.jpg")
-
-	got := c.Download(context.Background(), "M-OUT-1", "447700000099@s.whatsapp.net", outPath)
-	if !got.Success {
-		t.Fatalf("expected success, got: %+v", got)
-	}
-	assertSamePath(t, got.Path, outPath)
-	if _, err := os.Stat(outPath); err != nil {
-		t.Fatalf("output file missing: %v", err)
-	}
-	// Cache file untouched.
-	if _, err := os.Stat(cachePath); err != nil {
-		t.Fatalf("cache file vanished: %v", err)
-	}
-}
-
-// Editing the exported output must not change the cached copy: the output is
-// a separate file, not a hard link to the cache entry.
-func TestDownload_OutputPathIsolatedFromCache(t *testing.T) {
-	cachePath, mediaRoot, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-4", "p.jpg")
-	outPath := filepath.Join(mediaRoot, "isolated.jpg")
-
-	got := c.Download(context.Background(), "M-OUT-4", "447700000099@s.whatsapp.net", outPath)
-	if !got.Success {
-		t.Fatalf("expected success, got: %+v", got)
-	}
-	if err := os.WriteFile(outPath, []byte("CALLER-EDITED"), 0o600); err != nil {
-		t.Fatalf("edit output: %v", err)
-	}
-	cached, err := os.ReadFile(cachePath)
-	if err != nil {
-		t.Fatalf("read cache: %v", err)
-	}
-	if string(cached) != "PRETEND-JPEG-BYTES" {
-		t.Fatalf("cache file was modified through output_path: got %q", cached)
-	}
-}
-
-// assertSamePath compares two paths after resolving any platform-level
-// symlinks on their parent directories (e.g. macOS /var → /private/var).
-func assertSamePath(t *testing.T, got, want string) {
-	t.Helper()
-	resolve := func(p string) string {
-		dir, _ := filepath.EvalSymlinks(filepath.Dir(p))
-		return filepath.Join(dir, filepath.Base(p))
-	}
-	if resolve(got) != resolve(want) {
-		t.Fatalf("Path: want %q (resolved %q), got %q (resolved %q)", want, resolve(want), got, resolve(got))
-	}
-}
-
-// output_path outside the configured media root is rejected before any
-// filesystem write.
-func TestDownload_OutputPathRejectsOutsideRoot(t *testing.T) {
-	_, _, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-2", "p.jpg")
-	outside := filepath.Join(t.TempDir(), "stolen.jpg")
-
-	got := c.Download(context.Background(), "M-OUT-2", "447700000099@s.whatsapp.net", outside)
-	if got.Success {
-		t.Fatalf("expected failure, got success: %+v", got)
-	}
-	if !strings.Contains(got.Message, "allowed root") {
-		t.Fatalf("error should mention allowed root, got: %s", got.Message)
-	}
-	if _, err := os.Stat(outside); err == nil {
-		t.Fatalf("output file was written despite rejection")
-	}
-}
-
-// If a file already exists at output_path, the call fails and leaves the
-// file untouched: an unrelated file must not be reported as a download.
-func TestDownload_OutputPathExistingFileRejected(t *testing.T) {
-	_, mediaRoot, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-3", "p.jpg")
-	outPath := filepath.Join(mediaRoot, "already-there.jpg")
-	original := []byte("USER-EDITED-CONTENT")
-	if err := os.WriteFile(outPath, original, 0o600); err != nil {
-		t.Fatalf("seed existing output: %v", err)
-	}
-
-	got := c.Download(context.Background(), "M-OUT-3", "447700000099@s.whatsapp.net", outPath)
-	if got.Success {
-		t.Fatalf("expected failure for existing output_path, got: %+v", got)
-	}
-	onDisk, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if string(onDisk) != string(original) {
-		t.Fatalf("existing file content was overwritten: want %q, got %q", original, onDisk)
-	}
-}
-
-// A repeat call whose output_path already holds this message's media succeeds
-// without re-downloading, even after the cache entry has been removed.
-func TestDownload_OutputPathRepeatIdenticalIsNoop(t *testing.T) {
-	cachePath, mediaRoot, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-5", "p.jpg")
-	outPath := filepath.Join(mediaRoot, "repeat.jpg")
-
-	if got := c.Download(context.Background(), "M-OUT-5", "447700000099@s.whatsapp.net", outPath); !got.Success {
-		t.Fatalf("first call: expected success, got: %+v", got)
-	}
-	if err := os.Remove(cachePath); err != nil {
-		t.Fatalf("evict cache: %v", err)
-	}
-	c.downloadMedia = func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error) {
-		t.Fatal("repeat call downloaded again")
-		return nil, nil
-	}
-	got := c.Download(context.Background(), "M-OUT-5", "447700000099@s.whatsapp.net", outPath)
-	if !got.Success {
-		t.Fatalf("repeat call: expected success, got: %+v", got)
-	}
-	assertSamePath(t, got.Path, outPath)
-}
-
-// A symlink at output_path is rejected without reading its target, even when
-// the target holds the right bytes.
-func TestDownload_OutputPathSymlinkRejected(t *testing.T) {
-	cachePath, mediaRoot, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-OUT-6", "p.jpg")
-	payload, err := os.ReadFile(cachePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	outside := filepath.Join(t.TempDir(), "outside.jpg")
-	if err := os.WriteFile(outside, payload, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	outPath := filepath.Join(mediaRoot, "link.jpg")
-	if err := os.Symlink(outside, outPath); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-
-	got := c.Download(context.Background(), "M-OUT-6", "447700000099@s.whatsapp.net", outPath)
-	if got.Success || !strings.Contains(got.Message, "does not hold this media") {
-		t.Fatalf("expected rejection of symlinked output_path, got: %+v", got)
-	}
-}
-
-// A failed copy removes its partial output so the same path can be retried.
-func TestPlaceAtOutputRemovesPartialFile(t *testing.T) {
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "out.jpg")
-	if err := placeAtOutput(dir, dst); err == nil { // reading a directory fails mid-copy
-		t.Fatal("expected copy failure")
-	}
-	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
-		t.Fatalf("partial output left behind: %v", err)
-	}
-	src := filepath.Join(dir, "src.jpg")
-	if err := os.WriteFile(src, []byte("DATA"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := placeAtOutput(src, dst); err != nil {
-		t.Fatalf("retry failed: %v", err)
 	}
 }

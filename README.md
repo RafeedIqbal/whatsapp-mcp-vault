@@ -1,5 +1,12 @@
 # WhatsApp MCP Server
 
+> [!IMPORTANT]
+> **This is a work-in-progress fork of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp)** (MIT), being reworked into a hosted server where each person runs their own private instance and everything on disk is encrypted. It is not affiliated with the upstream project, WhatsApp or Meta.
+>
+> What has changed so far, and what has not been built yet, is listed under "Fork status" in [AGENTS.md](AGENTS.md). The rest of this README, including the badges and install instructions below, still describes the upstream project and has not been updated.
+>
+> This server links to WhatsApp as an unofficial linked device. That is against WhatsApp's Terms of Service and can get an account restricted or banned. Use it at your own risk.
+
 [![License: MIT](https://img.shields.io/github/license/Sealjay/mcp-whatsapp)](LICENSE)
 [![CI](https://github.com/Sealjay/mcp-whatsapp/actions/workflows/ci.yml/badge.svg)](https://github.com/Sealjay/mcp-whatsapp/actions/workflows/ci.yml)
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)

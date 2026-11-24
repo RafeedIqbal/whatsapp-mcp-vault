@@ -2,6 +2,18 @@
 
 Single Go binary that runs as an HTTP MCP daemon (default `127.0.0.1:8765`) wrapping [whatsmeow](https://github.com/tulir/whatsmeow) to expose a personal WhatsApp account as MCP tools. `whatsapp-mcp serve` tracks WhatsApp events, caches messages locally, serves MCP at `/mcp`, and hosts the pairing UI at `/pair`. MCP clients connect over stateless Streamable HTTP (`server.WithStateLess(true)`; MCP 2026-07-28 and older revisions, no `Mcp-Session-Id`).
 
+## Fork status: locked-vault build (in progress)
+
+This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-per-person server. The approved plan and the progress ledger live outside the tree (`.superpowers/sdd/.../progress.md`, git-ignored). Done so far (milestone 1):
+
+- **Everything on disk is SQLCipher-encrypted.** `internal/vault` owns the instance key and opens both databases (`vault.OpenDB`); `store.Open(dir, key)` and `client.Config.Key` require it. There is no plaintext mode: a build without the cipher, a missing key, or a wrong key is a hard error. Driver: `github.com/mutecomm/go-sqlcipher/v4` (it registers as `sqlite3`; do not add `mattn/go-sqlite3`, the two cannot be linked together).
+- **Key source (interim):** env `WHATSAPP_MCP_VAULT_KEY`, 64 hex chars, read by `cmd/whatsapp-mcp/vaultkey.go`. The plan replaces this with a passphrase/OAuth-token-wrapped key and connect-on-demand (milestones 2 and 3).
+- **Search** uses an FTS4 index (`internal/store/search.go`), kept in step by triggers; FTS4 rather than FTS5 so no build tag is needed.
+- **Decrypted media is never written to disk.** `client.Download*` return bytes (`DownloadResult.Data`, 64 MiB cap); `download_media` returns image/audio blocks or an embedded resource (5 MiB cap) and has no `output_path`.
+- Tests that need a store use `vaulttest.Key()`; fixtures that seed a database file by hand use `vaulttest.OpenDB`.
+
+Not done yet: OAuth sign-in and setup page, connect-on-demand, attachments by URL/upload (send tools still take server file paths under `WHATSAPP_MCP_MEDIA_ROOT`), per-permission tool filtering, send safety changes, hosting files. Sections below still describe upstream behaviour where they have not been touched.
+
 ## Structure
 
 ```text

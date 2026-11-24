@@ -5,8 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -14,13 +12,9 @@ import (
 	"time"
 )
 
-func writeAudio(t *testing.T, content string) string {
+func writeAudio(t *testing.T, content string) Audio {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "voice.ogg")
-	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return Audio{Filename: "voice.ogg", Data: []byte(content)}
 }
 
 func TestTranscribe_Success(t *testing.T) {
@@ -200,7 +194,7 @@ func TestEndpoint_LoopbackRule(t *testing.T) {
 
 func TestTranscribe_RejectsRemoteHTTPBeforeReadingAudio(t *testing.T) {
 	cfg := Config{URL: "http://whisper.internal", AllowRemote: true, Token: "test-token"}
-	_, err := Transcribe(context.Background(), cfg, filepath.Join(t.TempDir(), "absent.ogg"), "")
+	_, err := Transcribe(context.Background(), cfg, Audio{Filename: "absent.ogg"}, "")
 	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
 		t.Fatalf("want TLS policy rejection before reading audio, got %v", err)
 	}

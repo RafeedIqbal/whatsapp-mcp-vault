@@ -79,8 +79,14 @@ func (s *Store) ListMessagesPage(ctx context.Context, params ListMessagesParams)
 		args = append(args, params.ChatJID)
 	}
 	if params.Query != "" {
-		whereClauses = append(whereClauses, "LOWER(messages.content) LIKE LOWER(?)")
-		args = append(args, "%"+params.Query+"%")
+		if match := searchMatchExpr(params.Query); match != "" {
+			whereClauses = append(whereClauses, "messages.rowid IN (SELECT docid FROM messages_fts WHERE messages_fts MATCH ?)")
+			args = append(args, match)
+		} else {
+			// Not answerable from the word index (see searchMatchExpr).
+			whereClauses = append(whereClauses, "LOWER(messages.content) LIKE LOWER(?)")
+			args = append(args, "%"+params.Query+"%")
+		}
 	}
 	if params.Cursor != "" {
 		ts, id, chatJID, err := decodeCursor(params.Cursor)

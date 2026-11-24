@@ -121,7 +121,7 @@ func (c *Client) normalizeIncomingMessage(
 	if !isGroup {
 		chatJID = c.store.ResolveLIDToJID(rawChatJID)
 		if chatJID != rawChatJID {
-			c.log.Infof("Normalized chat JID: %s -> %s", c.redactor.JID(rawChatJID), c.redactor.JID(chatJID))
+			c.log.Debugf("Normalized chat JID: %s -> %s", c.redactor.JID(rawChatJID), c.redactor.JID(chatJID))
 		}
 	}
 
@@ -130,7 +130,7 @@ func (c *Client) normalizeIncomingMessage(
 	normalizedSender := c.store.ResolveLIDToJID(rawSenderJID)
 	if normalizedSender != rawSenderJID {
 		sender = strings.Split(normalizedSender, "@")[0]
-		c.log.Infof("Normalized sender: %s -> %s", c.redactor.JID(senderUser), c.redactor.JID(sender))
+		c.log.Debugf("Normalized sender: %s -> %s", c.redactor.JID(senderUser), c.redactor.JID(sender))
 	}
 
 	// If the message is from us and we have no better sender, use ownID.
@@ -227,9 +227,9 @@ func (c *Client) handleMessage(msg *events.Message) {
 	}
 	ts := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 	if nm.msg.MediaType != "" {
-		c.log.Infof("[%s] %s %s: [%s: %s] %s", ts, direction, c.redactor.JID(nm.msg.Sender), nm.msg.MediaType, c.redactor.Body(nm.msg.Filename), c.redactor.Body(nm.msg.Content))
+		c.log.Debugf("[%s] %s %s: [%s: %s] %s", ts, direction, c.redactor.JID(nm.msg.Sender), nm.msg.MediaType, c.redactor.Body(nm.msg.Filename), c.redactor.Body(nm.msg.Content))
 	} else if nm.msg.Content != "" {
-		c.log.Infof("[%s] %s %s: %s", ts, direction, c.redactor.JID(nm.msg.Sender), c.redactor.Body(nm.msg.Content))
+		c.log.Debugf("[%s] %s %s: %s", ts, direction, c.redactor.JID(nm.msg.Sender), c.redactor.Body(nm.msg.Content))
 	}
 }
 
@@ -278,7 +278,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 		if !isGroup {
 			chatJID = c.store.ResolveLIDToJID(rawChatJID)
 			if chatJID != rawChatJID {
-				c.log.Infof("History sync: Normalized chat JID: %s -> %s", c.redactor.JID(rawChatJID), c.redactor.JID(chatJID))
+				c.log.Debugf("History sync: Normalized chat JID: %s -> %s", c.redactor.JID(rawChatJID), c.redactor.JID(chatJID))
 			}
 		}
 
@@ -390,7 +390,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 				}
 			}
 
-			c.log.Infof("Message content: %s, Media Type: %s", c.redactor.Body(nm.msg.Content), nm.msg.MediaType)
+			c.log.Debugf("Message content: %s, Media Type: %s", c.redactor.Body(nm.msg.Content), nm.msg.MediaType)
 			if nm.msg.Content == "" && nm.msg.MediaType == "" {
 				continue
 			}
@@ -408,10 +408,10 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 				votes = append(votes, c.aggregatedPollVotes(msg.Message, msgID, chatJID, isGroup, ownID, timestamp)...)
 			}
 			if nm.msg.MediaType != "" {
-				c.log.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+				c.log.Debugf("Stored message: [%s] %s -> %s: [%s: %s] %s",
 					timestamp.Format("2006-01-02 15:04:05"), c.redactor.JID(nm.msg.Sender), c.redactor.JID(chatJID), nm.msg.MediaType, c.redactor.Body(nm.msg.Filename), c.redactor.Body(nm.msg.Content))
 			} else {
-				c.log.Infof("Stored message: [%s] %s -> %s: %s",
+				c.log.Debugf("Stored message: [%s] %s -> %s: %s",
 					timestamp.Format("2006-01-02 15:04:05"), c.redactor.JID(nm.msg.Sender), c.redactor.JID(chatJID), c.redactor.Body(nm.msg.Content))
 			}
 		}
@@ -573,13 +573,13 @@ func (c *Client) GetChatName(jid types.JID, chatJID string, conversation *waHist
 			name = c.resolveChatNameFallback(context.Background(), jid, sender)
 		}
 
-		c.log.Infof("Using group name for %s: %s", c.redactor.JID(chatJID), c.redactor.Body(name))
+		c.log.Debugf("Using group name for %s: %s", c.redactor.JID(chatJID), c.redactor.Body(name))
 	} else {
 		c.log.Debugf("Getting name for contact: %s", c.redactor.JID(chatJID))
 
 		name = c.resolveChatNameFallback(context.Background(), jid, sender)
 
-		c.log.Infof("Using contact name for %s: %s", c.redactor.JID(chatJID), c.redactor.Body(name))
+		c.log.Debugf("Using contact name for %s: %s", c.redactor.JID(chatJID), c.redactor.Body(name))
 	}
 
 	return name

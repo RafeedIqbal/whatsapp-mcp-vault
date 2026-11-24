@@ -103,17 +103,21 @@ type Result struct {
 	Duration float64 `json:"duration_seconds,omitempty"`
 }
 
-// Transcribe uploads the audio file at path to the service. language overrides
-// the configured default when non-empty.
-func Transcribe(ctx context.Context, cfg Config, path, language string) (Result, error) {
+// Audio is a clip to transcribe. It is held in memory: decrypted media is never
+// written to disk.
+type Audio struct {
+	Filename string // name sent to the service; only its extension matters
+	Data     []byte
+}
+
+// Transcribe uploads audio to the service. language overrides the configured
+// default when non-empty.
+func Transcribe(ctx context.Context, cfg Config, audio Audio, language string) (Result, error) {
 	endpoint, err := cfg.endpoint()
 	if err != nil {
 		return Result{}, err
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Result{}, fmt.Errorf("transcription: read audio: %w", err)
-	}
+	data := audio.Data
 	if len(data) == 0 {
 		return Result{}, errors.New("transcription: audio file is empty")
 	}
@@ -123,7 +127,7 @@ func Transcribe(ctx context.Context, cfg Config, path, language string) (Result,
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
-	fw, err := mw.CreateFormFile("file", filepath.Base(path))
+	fw, err := mw.CreateFormFile("file", filepath.Base(audio.Filename))
 	if err != nil {
 		return Result{}, err
 	}

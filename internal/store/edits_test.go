@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -346,7 +347,7 @@ func TestMigrateSchema_AddsEditAndRevokeColumns(t *testing.T) {
 	dir := t.TempDir()
 
 	// A database from before edits and revokes were tracked.
-	legacy, err := sql.Open("sqlite3", "file:"+filepath.Join(dir, "messages.db")+"?_foreign_keys=on")
+	legacy, err := vaulttest.OpenDB(filepath.Join(dir, "messages.db"), MessagesDBName)
 	if err != nil {
 		t.Fatalf("open legacy DB: %v", err)
 	}
@@ -372,7 +373,7 @@ func TestMigrateSchema_AddsEditAndRevokeColumns(t *testing.T) {
 	_ = legacy.Close()
 
 	for i := 0; i < 2; i++ { // the second Open checks the migration is idempotent
-		s, err := Open(dir)
+		s, err := Open(dir, vaulttest.Key())
 		if err != nil {
 			t.Fatalf("Open #%d: %v", i+1, err)
 		}

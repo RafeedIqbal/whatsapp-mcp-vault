@@ -3,8 +3,6 @@ package mcp
 import (
 	"encoding/base64"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -22,15 +20,17 @@ var jpegMagic = []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0
 // Opus payload following it.
 var oggMagic = []byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00")
 
-// writeFile writes bytes to a fresh path under t.TempDir() and returns the
-// absolute path. Fatals the test on any I/O error.
-func writeFile(t *testing.T, name string, data []byte) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+const testMediaURI = "whatsapp://media/447700000001%40s.whatsapp.net/MSG1"
+
+func downloaded(mediaType, filename string, data []byte) client.DownloadResult {
+	return client.DownloadResult{
+		Success:   true,
+		Message:   "Successfully downloaded " + mediaType + " media",
+		MediaType: mediaType,
+		Filename:  filename,
+		Size:      len(data),
+		Data:      data,
 	}
-	return path
 }
 
 // firstText returns the Text field of the first content block, which the
@@ -47,42 +47,30 @@ func firstText(t *testing.T, res *mcp.CallToolResult) string {
 	return txt.Text
 }
 
-// assertJSONSummary parses the first (text) content block and checks the
-// key fields are what we expected. Any mismatch fatals — this is the
-// backwards-compat contract with pre-inline callers.
-func assertJSONSummary(t *testing.T, res *mcp.CallToolResult, want client.DownloadResult) {
+// summary parses the first content block as the JSON summary.
+func summary(t *testing.T, res *mcp.CallToolResult) map[string]any {
 	t.Helper()
-	var got client.DownloadResult
+	var got map[string]any
 	if err := json.Unmarshal([]byte(firstText(t, res)), &got); err != nil {
 		t.Fatalf("summary is not JSON: %v (raw: %q)", err, firstText(t, res))
 	}
-	if got != want {
-		t.Errorf("summary = %+v, want %+v", got, want)
-	}
+	return got
 }
 
-// TestDownloadMediaResult_ImageInlined: a successful image download whose
-// file is on disk and under the size cap should yield two content blocks
-// — the JSON summary and an ImageContent with base64 bytes.
-func TestDownloadMediaResult_ImageInlined(t *testing.T) {
-	path := writeFile(t, "img.jpg", jpegMagic)
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded image media",
-		MediaType: "image",
-		Filename:  "img.jpg",
-		Path:      path,
-	}
-
-	res, err := downloadMediaResult(r)
+func mustResult(t *testing.T, r client.DownloadResult) *mcp.CallToolResult {
+	t.Helper()
+	res, err := downloadMediaResult(r, testMediaURI)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
+	return res
+}
+
+func TestDownloadMediaResult_ImageInlined(t *testing.T) {
+	res := mustResult(t, downloaded("image", "img.jpg", jpegMagic))
 	if len(res.Content) != 2 {
 		t.Fatalf("expected 2 content blocks, got %d", len(res.Content))
 	}
-	assertJSONSummary(t, res, r)
-
 	img, ok := res.Content[1].(mcp.ImageContent)
 	if !ok {
 		t.Fatalf("content[1] should be ImageContent, got %T", res.Content[1])
@@ -91,30 +79,13 @@ func TestDownloadMediaResult_ImageInlined(t *testing.T) {
 		t.Errorf("MIMEType = %q, want image/jpeg", img.MIMEType)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(img.Data)
-	if err != nil {
-		t.Fatalf("image data is not base64: %v", err)
-	}
-	if string(decoded) != string(jpegMagic) {
-		t.Errorf("decoded bytes = %x, want %x", decoded, jpegMagic)
+	if err != nil || string(decoded) != string(jpegMagic) {
+		t.Errorf("decoded bytes = %x err=%v, want %x", decoded, err, jpegMagic)
 	}
 }
 
-// TestDownloadMediaResult_AudioInlined: successful audio download inlines
-// bytes as AudioContent with the sniffed MIME.
 func TestDownloadMediaResult_AudioInlined(t *testing.T) {
-	path := writeFile(t, "voice.ogg", oggMagic)
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded audio media",
-		MediaType: "audio",
-		Filename:  "voice.ogg",
-		Path:      path,
-	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
-	}
+	res := mustResult(t, downloaded("audio", "voice.ogg", oggMagic))
 	if len(res.Content) != 2 {
 		t.Fatalf("expected 2 content blocks, got %d", len(res.Content))
 	}
@@ -127,114 +98,82 @@ func TestDownloadMediaResult_AudioInlined(t *testing.T) {
 	}
 }
 
-// TestDownloadMediaResult_DocumentPathOnly: documents aren't renderable
-// inline, so the result carries only the JSON summary. The caller still
-// gets Path and can fetch the file out of band.
-func TestDownloadMediaResult_DocumentPathOnly(t *testing.T) {
-	path := writeFile(t, "spec.pdf", []byte("%PDF-1.4"))
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded document media",
-		MediaType: "document",
-		Filename:  "spec.pdf",
-		Path:      path,
+// Documents and videos have no image/audio content type, so a remote client
+// receives them as an embedded resource carrying the bytes.
+func TestDownloadMediaResult_DocumentEmbeddedAsResource(t *testing.T) {
+	pdf := []byte("%PDF-1.4 minimal")
+	res := mustResult(t, downloaded("document", "spec.pdf", pdf))
+	if len(res.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(res.Content))
 	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
+	emb, ok := res.Content[1].(mcp.EmbeddedResource)
+	if !ok {
+		t.Fatalf("content[1] should be EmbeddedResource, got %T", res.Content[1])
 	}
-	if len(res.Content) != 1 {
-		t.Fatalf("expected 1 content block (document is not inlined), got %d", len(res.Content))
+	blob, ok := emb.Resource.(mcp.BlobResourceContents)
+	if !ok {
+		t.Fatalf("embedded resource should be a blob, got %T", emb.Resource)
 	}
-	assertJSONSummary(t, res, r)
-}
-
-// TestDownloadMediaResult_VideoPathOnly: same as document — not embedded,
-// caller must fetch via Path.
-func TestDownloadMediaResult_VideoPathOnly(t *testing.T) {
-	path := writeFile(t, "clip.mp4", []byte{0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p'})
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded video media",
-		MediaType: "video",
-		Filename:  "clip.mp4",
-		Path:      path,
+	if blob.URI != testMediaURI {
+		t.Errorf("URI = %q, want %q", blob.URI, testMediaURI)
 	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
+	if blob.MIMEType != "application/pdf" {
+		t.Errorf("MIMEType = %q, want application/pdf", blob.MIMEType)
 	}
-	if len(res.Content) != 1 {
-		t.Fatalf("expected 1 content block for video, got %d", len(res.Content))
+	decoded, err := base64.StdEncoding.DecodeString(blob.Blob)
+	if err != nil || string(decoded) != string(pdf) {
+		t.Errorf("blob = %q err=%v, want the document bytes", decoded, err)
 	}
 }
 
-// TestDownloadMediaResult_FailurePathOnly: a failed download still returns
-// a well-formed CallToolResult with the JSON error, and no inline attempt
-// is made (there's no file to read).
-func TestDownloadMediaResult_FailurePathOnly(t *testing.T) {
-	r := client.DownloadResult{
+func TestDownloadMediaResult_VideoEmbeddedAsResource(t *testing.T) {
+	mp4 := []byte{0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'}
+	res := mustResult(t, downloaded("video", "clip.mp4", mp4))
+	if len(res.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(res.Content))
+	}
+	if _, ok := res.Content[1].(mcp.EmbeddedResource); !ok {
+		t.Fatalf("content[1] should be EmbeddedResource, got %T", res.Content[1])
+	}
+}
+
+func TestDownloadMediaResult_FailureIsSummaryOnly(t *testing.T) {
+	res := mustResult(t, client.DownloadResult{
 		Success: false,
 		Message: "failed to download media: download failed with status code 403",
-	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
-	}
+	})
 	if len(res.Content) != 1 {
 		t.Fatalf("expected 1 content block on failure, got %d", len(res.Content))
 	}
-	assertJSONSummary(t, res, r)
-}
-
-// TestDownloadMediaResult_MissingFileFallsBack: if the daemon says success
-// but the file has vanished (unlikely race), the tool still returns the
-// JSON summary rather than propagating the read error.
-func TestDownloadMediaResult_MissingFileFallsBack(t *testing.T) {
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded image media",
-		MediaType: "image",
-		Filename:  "gone.jpg",
-		Path:      filepath.Join(t.TempDir(), "does-not-exist.jpg"),
-	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
-	}
-	if len(res.Content) != 1 {
-		t.Fatalf("expected 1 content block when file is missing, got %d", len(res.Content))
+	if s := summary(t, res); s["success"] != false || !strings.Contains(s["message"].(string), "403") {
+		t.Errorf("summary = %v", s)
 	}
 }
 
-// TestDownloadMediaResult_OversizedNotInlined: files above the inline cap
-// stay reachable via Path but are NOT embedded. This protects the
-// transport frame and the LLM context from multi-megabyte payloads.
-func TestDownloadMediaResult_OversizedNotInlined(t *testing.T) {
-	// One byte over the cap. Prefix with jpegMagic so http.DetectContentType
-	// would return image/jpeg if we did read it — proving the size check is
-	// what suppresses embedding, not the sniffer.
+func TestDownloadMediaResult_OversizedIsNotEmbedded(t *testing.T) {
 	oversized := make([]byte, inlineMediaMaxBytes+1)
 	copy(oversized, jpegMagic)
-	path := writeFile(t, "huge.jpg", oversized)
-
-	r := client.DownloadResult{
-		Success:   true,
-		Message:   "Successfully downloaded image media",
-		MediaType: "image",
-		Filename:  "huge.jpg",
-		Path:      path,
-	}
-
-	res, err := downloadMediaResult(r)
-	if err != nil {
-		t.Fatalf("downloadMediaResult: %v", err)
-	}
+	res := mustResult(t, downloaded("image", "huge.jpg", oversized))
 	if len(res.Content) != 1 {
-		t.Fatalf("expected 1 content block for oversized file, got %d", len(res.Content))
+		t.Fatalf("expected 1 content block for oversized media, got %d", len(res.Content))
+	}
+	// The caller must be told why nothing came back, not just see a success.
+	if note, _ := summary(t, res)["note"].(string); !strings.Contains(note, "too large") {
+		t.Errorf("summary does not explain the missing media: %v", summary(t, res))
+	}
+}
+
+// The summary describes the media; it never carries a server file path (media
+// is not written to disk) and never the bytes themselves.
+func TestDownloadMediaResult_SummaryHasNoPathAndNoBytes(t *testing.T) {
+	res := mustResult(t, downloaded("image", "img.jpg", jpegMagic))
+	s := summary(t, res)
+	for _, forbidden := range []string{"path", "Path", "data", "Data"} {
+		if _, ok := s[forbidden]; ok {
+			t.Errorf("summary has a %q field: %v", forbidden, s)
+		}
+	}
+	if s["media_type"] != "image" || s["filename"] != "img.jpg" || s["size_bytes"] != float64(len(jpegMagic)) {
+		t.Errorf("summary = %v", s)
 	}
 }

@@ -17,13 +17,13 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	wmstore "go.mau.fi/whatsmeow/store"
-	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 const (
@@ -128,7 +128,7 @@ func TestHistorySyncPollAcrossChunks(t *testing.T) {
 func openPollReceiver(t *testing.T, dir string) (*Client, func()) {
 	t.Helper()
 	ctx := context.Background()
-	container, err := sqlstore.New(ctx, "sqlite3", "file:"+filepath.Join(dir, "whatsapp.db")+"?_foreign_keys=on", waLog.Noop)
+	container, err := openSessionStore(ctx, dir, vaulttest.Key(), waLog.Noop)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func openPollReceiver(t *testing.T, dir string) (*Client, func()) {
 			t.Fatal(err)
 		}
 	}
-	s, err := store.Open(dir)
+	s, err := store.Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestHistorySyncPollDependencyFailureDoesNotSkipReadyVoteBeforeRevoke(t *tes
 			if failure == "other-poll-secret" {
 				runHistorySync(c, pollChat, historyMsg(historyKey(pollChat, "VOTE-2", true, ""), secondVote))
 			}
-			waDB, err := sql.Open("sqlite3", filepath.Join(c.store.Dir(), "whatsapp.db"))
+			waDB, err := vaulttest.OpenDB(filepath.Join(c.store.Dir(), "whatsapp.db"), store.SessionDBName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -425,7 +425,7 @@ func TestHistorySyncPollStorageFailuresRetainPending(t *testing.T) {
 			var logs bytes.Buffer
 			c.log = &stderrLogger{out: &logs, mod: "test", min: logLevelToInt["DEBUG"]}
 			runHistorySync(c, pollChat, ownPollVoteMsg(t, builder, "Yes"))
-			waDB, err := sql.Open("sqlite3", filepath.Join(c.store.Dir(), "whatsapp.db"))
+			waDB, err := vaulttest.OpenDB(filepath.Join(c.store.Dir(), "whatsapp.db"), store.SessionDBName)
 			if err != nil {
 				t.Fatal(err)
 			}

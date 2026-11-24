@@ -43,7 +43,12 @@ func runLogin(storeDir string, redactor *security.Redactor, args []string) int {
 	}
 	defer lock.Release()
 
-	st, err := store.Open(storeDir)
+	vaultKey, keyErr := vaultKeyFromEnv(os.Getenv)
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", keyErr)
+		return 1
+	}
+	st, err := store.Open(storeDir, vaultKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
@@ -52,6 +57,7 @@ func runLogin(storeDir string, redactor *security.Redactor, args []string) int {
 
 	c, err := client.New(ctx, client.Config{
 		StoreDir: storeDir,
+		Key:      vaultKey,
 		Store:    st,
 		// login flow logs normally to stderr; the QR itself goes to stdout.
 		Logger:      client.NewStderrLogger("Client", "INFO", true),
@@ -62,7 +68,7 @@ func runLogin(storeDir string, redactor *security.Redactor, args []string) int {
 		fmt.Fprintf(os.Stderr, "init client: %v\n", err)
 		return 1
 	}
-	defer c.Disconnect()
+	defer c.Close()
 
 	if *phone != "" {
 		fmt.Fprintln(os.Stderr, "Starting phone-number pairing flow.")

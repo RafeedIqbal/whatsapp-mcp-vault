@@ -5,6 +5,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,14 +17,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 // harness runs ./bin/whatsapp-mcp serve on an OS-assigned loopback port
 // and offers a typed MCP tool-call helper.
 type harness struct {
-	t    *testing.T
-	cmd  *exec.Cmd
-	addr string
+	storeDir string // the daemon's -store directory
+	t        *testing.T
+	cmd      *exec.Cmd
+	addr     string
 }
 
 func newHarness(t *testing.T, serveArgs ...string) *harness {
@@ -46,13 +50,16 @@ func newHarness(t *testing.T, serveArgs ...string) *harness {
 
 	args := append([]string{"-store", storeDir, "serve", "-addr", addr}, serveArgs...)
 	cmd := exec.Command(bin, args...)
+	// The store is always encrypted, so the daemon will not start without a key.
+	key := vaulttest.Key()
+	cmd.Env = append(os.Environ(), "WHATSAPP_MCP_VAULT_KEY="+hex.EncodeToString(key[:]))
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start daemon: %v", err)
 	}
 
-	h := &harness{t: t, cmd: cmd, addr: addr}
+	h := &harness{t: t, cmd: cmd, addr: addr, storeDir: storeDir}
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 
 	h.waitForReady(45 * time.Second)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 func TestNewWAClient_ConfiguresFullSyncEventsBeforeConnect(t *testing.T) {
@@ -32,7 +33,7 @@ func TestResyncLabels_RejectsDisabledFeature(t *testing.T) {
 }
 
 func TestResyncLabels_DefersWhatsAppAppStateRateLimit(t *testing.T) {
-	s, err := store.Open(t.TempDir())
+	s, err := store.Open(t.TempDir(), vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}

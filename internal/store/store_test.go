@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 func TestSchemaIdempotent(t *testing.T) {
@@ -307,7 +308,7 @@ func TestMigrateSchema_AddsDirectPath(t *testing.T) {
 	// Pre-create a legacy messages.db WITHOUT the direct_path column.
 	// This mirrors the pre-migration schema (before poll_options_json even,
 	// so we exercise both migrations together).
-	legacy, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
+	legacy, err := vaulttest.OpenDB(dbPath, MessagesDBName)
 	if err != nil {
 		t.Fatalf("open legacy DB: %v", err)
 	}
@@ -334,7 +335,7 @@ func TestMigrateSchema_AddsDirectPath(t *testing.T) {
 
 	// Opening through the store must migrate — direct_path and poll_options_json
 	// both get ALTER'd on. Existing legacy row is preserved.
-	s, err := Open(dir)
+	s, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -360,7 +361,7 @@ func TestMigrateSchema_AddsDirectPath(t *testing.T) {
 
 	// Second Open must be a no-op — verifies migrateSchema is idempotent.
 	s.Close()
-	s2, err := Open(dir)
+	s2, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
@@ -434,12 +435,12 @@ func TestGetNewestMessage_EmptyChat(t *testing.T) {
 
 func TestOpen_EnablesWAL(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir)
+	s, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer s.Close()
-	db, err := sql.Open("sqlite3", "file:"+filepath.Join(dir, "messages.db")+"?_foreign_keys=on&_journal_mode=WAL")
+	db, err := vaulttest.OpenDB(filepath.Join(dir, "messages.db"), MessagesDBName)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
@@ -462,7 +463,7 @@ func TestOpen_StorePermissions(t *testing.T) {
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatalf("pre-chmod dir: %v", err)
 	}
-	s, err := Open(dir)
+	s, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

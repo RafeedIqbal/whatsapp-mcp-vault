@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +26,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 const (
@@ -67,7 +67,7 @@ func newRetryFixture(t *testing.T, msgID string) *retryFixture {
 func newRetryFixtureWithHashes(t *testing.T, msgID string, payload, mediaKey, fileSHA256, fileEncSHA256 []byte) *retryFixture {
 	t.Helper()
 	t.Chdir(t.TempDir())
-	s, err := store.Open("./store")
+	s, err := store.Open("./store", vaulttest.Key())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -201,12 +201,12 @@ func TestDownload_MediaRetryRecoversExpiredLink(t *testing.T) {
 		return successAnswer(t, string(info.ID), retryNewPath)
 	}
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if !got.Success {
 		t.Fatalf("expected success, got %+v", got)
 	}
-	if data, err := os.ReadFile(got.Path); err != nil || !bytes.Equal(data, f.payload) {
-		t.Fatalf("cached file: %q err=%v", data, err)
+	if !bytes.Equal(got.Data, f.payload) {
+		t.Fatalf("returned bytes: %q", got.Data)
 	}
 	if paths := f.paths(); len(paths) != 2 || paths[0] != retryOldPath || paths[1] != retryNewPath {
 		t.Fatalf("CDN requests: %q", paths)
@@ -228,11 +228,8 @@ func TestDownload_MediaRetryRecoversExpiredLink(t *testing.T) {
 		t.Fatalf("stored direct_path: got %q, want the re-uploaded path", dp)
 	}
 
-	// A later download after the cache is gone goes straight to the new path.
-	if err := os.Remove(got.Path); err != nil {
-		t.Fatal(err)
-	}
-	again := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	// A later download goes straight to the new path (nothing is cached).
+	again := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if !again.Success {
 		t.Fatalf("second download: %+v", again)
 	}
@@ -256,7 +253,7 @@ func TestDownload_MediaRetryDoesNotPersistUnverifiedPath(t *testing.T) {
 		return []byte("payload does not match the cached message hash"), nil
 	}
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if got.Success || !strings.Contains(got.Message, "downloaded media failed validation") {
 		t.Fatalf("expected payload validation failure, got %+v", got)
 	}
@@ -308,8 +305,8 @@ func TestDownload_MediaRetryRejectsMismatchedMediaKey(t *testing.T) {
 		)
 	}
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
-	if got.Success || got.Path != "" || !strings.Contains(got.Message, whatsmeow.ErrInvalidMediaHMAC.Error()) {
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
+	if got.Success || got.Data != nil || !strings.Contains(got.Message, whatsmeow.ErrInvalidMediaHMAC.Error()) {
 		t.Fatalf("expected explicit media-key authentication failure, got %+v", got)
 	}
 	if paths := f.paths(); len(paths) != 2 || paths[0] != retryOldPath || paths[1] != retryNewPath {
@@ -367,7 +364,7 @@ func TestDownload_MediaRetryPhoneFailures(t *testing.T) {
 			f := newRetryFixture(t, "M-RETRY-FAIL")
 			f.answer = func(info *types.MessageInfo) *events.MediaRetry { return tc.answer(t, string(info.ID)) }
 
-			got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+			got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 			if got.Success {
 				t.Fatalf("expected failure, got %+v", got)
 			}
@@ -389,7 +386,7 @@ func TestDownload_MediaRetryTimesOutWhenPhoneIsSilent(t *testing.T) {
 	f := newRetryFixture(t, "M-RETRY-SILENT")
 	f.c.mediaRetryTimeout = 50 * time.Millisecond
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if got.Success || !strings.Contains(got.Message, "the phone did not answer the re-upload request (it must be online)") {
 		t.Fatalf("expected timeout error, got %+v", got)
 	}
@@ -418,7 +415,7 @@ func TestDownload_MediaRetryHonoursContextCancel(t *testing.T) {
 	}
 
 	start := time.Now()
-	got := f.c.DownloadWithMediaRetry(ctx, f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(ctx, f.msgID, retryGroupJID)
 	if got.Success || !strings.Contains(got.Message, context.Canceled.Error()) {
 		t.Fatalf("expected cancellation, got %+v", got)
 	}
@@ -430,7 +427,7 @@ func TestDownload_MediaRetryHonoursContextCancel(t *testing.T) {
 	// An already-cancelled context sends no receipt at all.
 	done, stop := context.WithCancel(context.Background())
 	stop()
-	_ = f.c.DownloadWithMediaRetry(done, f.msgID, retryGroupJID, "")
+	_ = f.c.DownloadWithMediaRetry(done, f.msgID, retryGroupJID)
 	if n := f.receiptCount(); n != 1 {
 		t.Fatalf("receipts: got %d, want 1", n)
 	}
@@ -444,7 +441,7 @@ func TestDownload_MediaRetryConcurrentCallsShareOneReceipt(t *testing.T) {
 
 	results := make(chan DownloadResult, callers)
 	for range callers {
-		go func() { results <- f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "") }()
+		go func() { results <- f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID) }()
 	}
 
 	// Answer only once every caller has joined the outstanding retry.
@@ -500,7 +497,7 @@ func TestDownload_MediaRetryOnlyForExpiredLinks(t *testing.T) {
 			f.c.mediaRetryTimeout = 20 * time.Millisecond // the phone stays silent
 			f.cdnErr = func(string) error { return tc.err }
 
-			got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+			got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 			if got.Success || !strings.Contains(got.Message, tc.err.Error()) {
 				t.Fatalf("expected the CDN error, got %+v", got)
 			}
@@ -525,7 +522,7 @@ func TestDownload_MediaRetryRetriesDownloadOnce(t *testing.T) {
 		return successAnswer(t, string(info.ID), retryNewPath)
 	}
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if got.Success || !strings.Contains(got.Message, "status code 403") {
 		t.Fatalf("expected the second 403, got %+v", got)
 	}
@@ -546,7 +543,7 @@ func TestDownload_PlainDownloadNeverAsksThePhone(t *testing.T) {
 		return successAnswer(t, string(info.ID), retryNewPath)
 	}
 
-	got := f.c.Download(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.Download(context.Background(), f.msgID, retryGroupJID)
 	if got.Success || got.Message != "failed to download media: "+whatsmeow.ErrMediaDownloadFailedWith403.Error() {
 		t.Fatalf("expected the plain 403 error, got %+v", got)
 	}
@@ -557,7 +554,7 @@ func TestDownload_PlainDownloadNeverAsksThePhone(t *testing.T) {
 
 func TestMediaRetryMessageInfo(t *testing.T) {
 	t.Chdir(t.TempDir())
-	s, err := store.Open("./store")
+	s, err := store.Open("./store", vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +650,7 @@ func TestDownload_MediaRetryErrorLogRedactsJIDs(t *testing.T) {
 	f.c.sendMediaRetry = func(context.Context, *types.MessageInfo, []byte) error {
 		return fmt.Errorf("receipt from %s@s.whatsapp.net in %s failed", retrySender, retryGroupJID)
 	}
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	if got.Success {
 		t.Fatal("download succeeded despite the failed recovery receipt")
 	}
@@ -703,7 +700,7 @@ func TestDownload_MediaRetryNamesLIDSenderInLIDGroup(t *testing.T) {
 		return successAnswer(t, string(info.ID), retryNewPath)
 	}
 
-	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID, "")
+	got := f.c.DownloadWithMediaRetry(context.Background(), f.msgID, retryGroupJID)
 	f.waitIdle(t)
 	if !got.Success {
 		t.Fatalf("download failed: %+v", got)

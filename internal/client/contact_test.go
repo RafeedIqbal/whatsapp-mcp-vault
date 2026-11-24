@@ -8,13 +8,14 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 // seedStoreWithChat opens a fresh store and inserts one chat plus (optionally)
 // one inbound message, so IsKnownContact has something to classify against.
 func seedStoreWithChat(t *testing.T, jid string, withInbound bool) *store.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir())
+	s, err := store.Open(t.TempDir(), vaulttest.Key())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestIsKnownContact_UnknownJIDIsCold(t *testing.T) {
 
 func TestIsKnownContact_GroupIsAlwaysKnown(t *testing.T) {
 	// Empty store — a group must be classified known without any query.
-	s, err := store.Open(t.TempDir())
+	s, err := store.Open(t.TempDir(), vaulttest.Key())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

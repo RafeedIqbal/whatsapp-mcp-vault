@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
 //go:embed testdata/seed.sql
@@ -45,6 +45,10 @@ func openTestStore(t *testing.T) *Store {
 	if _, err := db.Exec(string(seed)); err != nil {
 		db.Close()
 		t.Fatalf("apply seed: %v", err)
+	}
+	if err := ensureSearchIndex(db); err != nil {
+		db.Close()
+		t.Fatalf("search index: %v", err)
 	}
 
 	// A second handle to the same shared-cache DB, playing the role of

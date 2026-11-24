@@ -12,12 +12,13 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 func TestPollTimestampMigrationAndCanonicalWrites(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(t.TempDir())
+	s, err := Open(t.TempDir(), vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +82,7 @@ func TestPollTimestampMigrationAndCanonicalWrites(t *testing.T) {
 func TestPendingPollVotePersistenceAndBounds(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := Open(dir)
+	s, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func TestPendingPollVotePersistenceAndBounds(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir)
+	s, err = Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +150,7 @@ func TestPendingPollVotePersistenceAndBounds(t *testing.T) {
 
 func TestPendingPollVoteAtomicCompletion(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(t.TempDir())
+	s, err := Open(t.TempDir(), vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +241,7 @@ func TestPendingPollVoteAtomicCompletion(t *testing.T) {
 func TestPollChatAliasesAndLookupErrors(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	wa, err := sql.Open("sqlite3", filepath.Join(dir, "whatsapp.db"))
+	wa, err := vaulttest.OpenDB(filepath.Join(dir, "whatsapp.db"), SessionDBName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +249,7 @@ func TestPollChatAliasesAndLookupErrors(t *testing.T) {
 	if _, err := wa.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY,pn TEXT UNIQUE); INSERT INTO whatsmeow_lid_map VALUES ('22','2')`); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(dir)
+	s, err := Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +300,7 @@ func TestPollChatAliasesAndLookupErrors(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir)
+	s, err = Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}

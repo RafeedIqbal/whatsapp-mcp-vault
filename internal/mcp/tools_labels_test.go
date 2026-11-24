@@ -11,11 +11,12 @@ import (
 
 	"github.com/sealjay/mcp-whatsapp/internal/client"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 func TestListChatsByLabelPaginationOverflowThroughReadOnlyMCP(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(dir)
+	st, err := store.Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,6 +32,7 @@ func TestListChatsByLabelPaginationOverflowThroughReadOnlyMCP(t *testing.T) {
 
 	c, err := client.New(context.Background(), client.Config{
 		StoreDir:      dir,
+		Key:           vaulttest.Key(),
 		Store:         st,
 		Logger:        client.NewStderrLogger("test", "ERROR", false),
 		LabelsEnabled: true,

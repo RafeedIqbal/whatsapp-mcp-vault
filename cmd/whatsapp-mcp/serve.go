@@ -104,7 +104,12 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	// to drop outbound attachments.
 	fmt.Fprintf(os.Stderr, "media root: %s (drop outbound files here)\n", allowedMediaRoot)
 
-	st, err := store.Open(storeDir)
+	vaultKey, keyErr := vaultKeyFromEnv(os.Getenv)
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", keyErr)
+		return 1
+	}
+	st, err := store.Open(storeDir, vaultKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
@@ -113,6 +118,7 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 
 	c, err := client.New(ctx, client.Config{
 		StoreDir:         storeDir,
+		Key:              vaultKey,
 		Store:            st,
 		Logger:           client.NewStderrLogger("Client", "INFO", false),
 		AllowedMediaRoot: allowedMediaRoot,
@@ -124,6 +130,9 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		fmt.Fprintf(os.Stderr, "init client: %v\n", err)
 		return 1
 	}
+	// Runs before st.Close (deferred earlier): disconnects and settles the
+	// session database so shutdown leaves nothing pending in its log.
+	defer c.Close()
 
 	drv := newProductionDriver(c)
 

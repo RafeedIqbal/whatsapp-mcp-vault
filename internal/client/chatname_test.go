@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"github.com/sealjay/mcp-whatsapp/internal/vault/vaulttest"
 )
 
 // newClientWithStore builds a *Client that has only the message store and
@@ -40,7 +40,7 @@ func newTestStoreWithLIDMap(t *testing.T, lidMap map[string]string) *store.Store
 
 	// Pre-create whatsapp.db with the whatsmeow_lid_map table and rows.
 	waPath := filepath.Join(dir, "whatsapp.db")
-	waDB, err := sql.Open("sqlite3", "file:"+waPath+"?_foreign_keys=on")
+	waDB, err := vaulttest.OpenDB(waPath, store.SessionDBName)
 	if err != nil {
 		t.Fatalf("open pre-seed whatsapp.db: %v", err)
 	}
@@ -72,7 +72,7 @@ func newTestStoreWithLIDMap(t *testing.T, lidMap map[string]string) *store.Store
 		t.Fatalf("close pre-seed db: %v", err)
 	}
 
-	s, err := store.Open(dir)
+	s, err := store.Open(dir, vaulttest.Key())
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

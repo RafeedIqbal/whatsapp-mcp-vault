@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/sealjay/mcp-whatsapp/internal/vault"
 )
 
 // ChmodBestEffort tightens a path's permissions but tolerates filesystems that
@@ -97,11 +97,18 @@ type Store struct {
 	dir         string
 }
 
-// Open creates (if necessary) the store directory and opens both databases.
-// Dir is the directory holding messages.db and whatsapp.db. The directory is
-// created/tightened to 0700 and each .db file ends up at 0600 to keep session
-// material and cached message contents off other local users' radar.
-func Open(dir string) (*Store, error) {
+// MessagesDBName and SessionDBName name the two databases for key derivation:
+// each is encrypted under its own subkey of the instance key.
+const (
+	MessagesDBName = "messages"
+	SessionDBName  = "whatsapp"
+)
+
+// Open creates (if necessary) the store directory and opens both databases,
+// encrypted under key. Dir is the directory holding messages.db and
+// whatsapp.db. Nothing is written to either file in the clear; the directory
+// and files are additionally tightened to 0700/0600.
+func Open(dir string, key vault.Key) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
 	}
@@ -111,7 +118,7 @@ func Open(dir string) (*Store, error) {
 	msgPath := filepath.Join(dir, "messages.db")
 	waPath := filepath.Join(dir, "whatsapp.db")
 
-	db, err := sql.Open("sqlite3", "file:"+msgPath+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
+	db, err := vault.OpenDB(msgPath, key, MessagesDBName, vault.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("open messages db: %w", err)
 	}
@@ -122,6 +129,10 @@ func Open(dir string) (*Store, error) {
 	if err := migrateSchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
+	if err := ensureSearchIndex(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if _, err := db.Exec(labelsSchema); err != nil {
 		db.Close()
@@ -140,7 +151,7 @@ func Open(dir string) (*Store, error) {
 	}
 
 	// whatsapp.db may not yet exist on first run; open lazily in read-only mode.
-	waDB, err := sql.Open("sqlite3", "file:"+waPath+"?mode=ro")
+	waDB, err := vault.OpenDB(waPath, key, SessionDBName, vault.Options{ReadOnly: true, Lazy: true})
 	if err != nil {
 		// Non-fatal: LID resolution falls through to identity.
 		waDB = nil

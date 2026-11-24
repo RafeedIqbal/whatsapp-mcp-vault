@@ -26,11 +26,13 @@ import (
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"github.com/sealjay/mcp-whatsapp/internal/transcribe"
+	"github.com/sealjay/mcp-whatsapp/internal/vault"
 )
 
 // Config configures a new Client.
 type Config struct {
 	StoreDir         string             // directory holding messages.db and whatsapp.db
+	Key              vault.Key          // instance data key; whatsapp.db is encrypted under it
 	Store            *store.Store       // initialized message store
 	Logger           waLog.Logger       // optional; defaults to stderr at INFO
 	AllowedMediaRoot string             // absolute path; media_path args must live under this
@@ -56,6 +58,7 @@ type Client struct {
 	groupInfo        func(context.Context, types.JID) (*types.GroupInfo, error)
 	sendMediaRetry   func(context.Context, *types.MessageInfo, []byte) error
 	store            *store.Store
+	session          *sessionStore // whatsmeow's own database; closed by Close
 	log              waLog.Logger
 	handlerID        uint32
 	handlerInstalled bool
@@ -77,7 +80,7 @@ type Client struct {
 	mediaRetryLIDs      wmstore.LIDStore
 	// Speech-to-text (see transcribe.go). transcribeFn is a test seam.
 	transcribeCfg transcribe.Config
-	transcribeFn  func(ctx context.Context, cfg transcribe.Config, path, language string) (transcribe.Result, error)
+	transcribeFn  func(ctx context.Context, cfg transcribe.Config, audio transcribe.Audio, language string) (transcribe.Result, error)
 	transcribeMu  sync.Mutex
 	// isConnected and waSend are wa's IsConnected and SendMessage, used by
 	// SendReply, SendReaction, polls and contact cards (waSend through the
@@ -150,7 +153,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	dbLog := NewStderrLogger("Database", "INFO", true)
 	waPath := filepath.Join(cfg.StoreDir, "whatsapp.db")
-	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waPath+"?_foreign_keys=on", redactingLogger{inner: dbLog, redactor: redactor})
+	container, err := openSessionStore(ctx, cfg.StoreDir, cfg.Key, redactingLogger{inner: dbLog, redactor: redactor})
 	if err != nil {
 		return nil, fmt.Errorf("open whatsmeow sqlstore: %w", err)
 	}
@@ -188,6 +191,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c := &Client{
 		wa:               wa,
 		store:            cfg.Store,
+		session:          container,
 		log:              logger,
 		allowedMediaRoot: cfg.AllowedMediaRoot,
 		redactor:         redactor,
@@ -220,13 +224,6 @@ func (c *Client) waClient() *whatsmeow.Client {
 // over calling the package-level helper directly.
 func (c *Client) ValidateMediaPath(userPath string) (string, error) {
 	return security.ValidateMediaPath(userPath, c.allowedMediaRoot)
-}
-
-// ValidateOutputPath is the sister wrapper for paths the daemon is about to
-// *write* to (e.g. download_media's output_path). Parent dir must exist; the
-// final file does not.
-func (c *Client) ValidateOutputPath(userPath string) (string, error) {
-	return security.ValidateOutputPath(userPath, c.allowedMediaRoot)
 }
 
 // IsLoggedIn reports whether the underlying whatsmeow device has a stored
@@ -411,6 +408,17 @@ func (c *Client) Disconnect() {
 	c.trackConnectionEvent(&events.Disconnected{})
 }
 
+// Close disconnects from WhatsApp and closes the session database, leaving it
+// fully written to its main file. Call it once, when the process is done with
+// the client; the client must not be used afterwards.
+func (c *Client) Close() error {
+	c.Disconnect()
+	if c.session == nil {
+		return nil
+	}
+	return c.session.Close()
+}
+
 // IsConnected reports whether the underlying whatsmeow client currently
 // holds a live WebSocket to WhatsApp. Used by the daemon state machine to
 // skip a second Connect call after a pairing-driven connect has already
@@ -436,3 +444,42 @@ func (c *Client) WA() *whatsmeow.Client { return c.waClient() }
 
 // Store returns the message cache.
 func (c *Client) Store() *store.Store { return c.store }
+
+// sessionStore is whatsmeow's own database (the linked-device identity, Signal
+// sessions and pre-keys) together with the handle needed to settle it on close.
+type sessionStore struct {
+	*sqlstore.Container
+	db *sql.DB
+}
+
+// Close folds the write-ahead log into the main database file and then closes
+// the database. The message store keeps a read-only handle on the same file,
+// and SQLite only folds the log automatically when the last handle closes
+// cleanly from a writer, so without this step shutdown leaves megabytes of
+// session state sitting in the log.
+func (s *sessionStore) Close() error {
+	_, checkpointErr := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	if err := s.Container.Close(); err != nil {
+		return err
+	}
+	if checkpointErr != nil {
+		return fmt.Errorf("settle session database: %w", checkpointErr)
+	}
+	return nil
+}
+
+// openSessionStore opens whatsmeow's own database encrypted under key, and
+// brings its schema up to date. These are the keys that let the instance act
+// as the account, so they are never written in the clear.
+func openSessionStore(ctx context.Context, dir string, key vault.Key, log waLog.Logger) (*sessionStore, error) {
+	db, err := vault.OpenDB(filepath.Join(dir, "whatsapp.db"), key, store.SessionDBName, vault.Options{})
+	if err != nil {
+		return nil, err
+	}
+	container := sqlstore.NewWithDB(db, "sqlite3", log)
+	if err := container.Upgrade(ctx); err != nil {
+		_ = container.Close()
+		return nil, fmt.Errorf("upgrade session database: %w", err)
+	}
+	return &sessionStore{Container: container, db: db}, nil
+}
