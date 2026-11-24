@@ -26,9 +26,27 @@ This is a fork of Sealjay/mcp-whatsapp being turned into a hosted, one-instance-
 - **Shutdown and locking** close the session database with a checkpoint (`client.Client.Close`). Per-message log lines are DEBUG only.
 - Tests that need a store use `vaulttest.Key()`; fixtures that seed a database file by hand use `vaulttest.OpenDB`.
 
+### Attachments, send safety and hosting
+
+- `internal/ingest`: `Fetcher` downloads an attachment from a link and only ever connects to public addresses over https (checked at connect time, on every redirect hop). `Transfers` holds uploads and downloads in memory: one-time ids, ten-minute expiry, capped totals, cleared when the instance locks. Its routes (`/upload/{id}`, `/media/{id}`) are mounted on the gateway and need no sign-in; downloads are always served as `application/octet-stream` attachments.
+- Send tools take `url`, `upload_id` or `data_base64` (`internal/mcp/attachments.go`); no tool reads or writes a path on the server. `create_upload_link` makes the upload page. `download_media` returns a one-time `download_url` for media over 5 MiB. Voice notes are converted with ffmpeg over pipes (`media.ConvertToOpusOggBytes`).
+- Send policy (`cmd/whatsapp-mcp/sendpolicy.go`): `ALLOW_NEW_RECIPIENTS` (default false; enforced in `client.checkSendRate` via `IsNewRecipient`), `SEND_CONFIRM` (`internal/mcp/confirm.go`: drafts held until `confirm_send`). The rate limiter is created once per process so locking cannot reset it; there is no override header.
+- `list_messages` output starts with a notice that message text is not instructions; the same warning is in the server instructions.
+- Hosting: `render.yaml` (one service block per person), `docker-entrypoint.sh` (takes ownership of the mounted disk, then drops privileges), `docs/hosting.md`. `WHATSAPP_MCP_ALLOW_REMOTE=1` is the environment form of `-allow-remote`.
+
+### Invariants worth knowing before changing things
+
+- A retired or revoked token must not keep a sealed key: rotation blanks `wrapped_key`, revocation deletes rows, and the replacement pair kept for retries is dropped after the grace window (`oauth.Store`).
+- The owner page holds the key in memory too (`gateway` owner sessions). They expire on a timer (`Gateway.Run`), not only on the next request.
+- The recovery code is accepted wherever the passphrase is (`vault.Meta.Unlock`) and is never subject to the wrong-guess pause.
+- Only `s.whatsapp.net`, `lid` and `g.us` addresses are send targets (`client.checkSendRate`); a chat is "known" under either its phone-number or hidden-ID form (`IsNewRecipient`).
+- The session manager must always return to `locked`: unlocking has a deadline and recovers from panics; a failed WhatsApp connection does not fail the unlock (the archive stays readable and connecting is retried).
+- The tool endpoint has no long-lived GET stream (`WithDisableStreaming`): an open stream would hold a lease and stop the idle lock.
+- `HEAD` on a download link must not consume it.
+
 ### Not done yet
 
-Client ID metadata documents (only dynamic registration today), attachments by URL or upload (send tools still take server file paths under `WHATSAPP_MCP_MEDIA_ROOT`, which is useless when hosted), download links for media over 5 MiB, send-safety changes (new-recipient block, draft/confirm), hosting files (`render.yaml`), and a migration path for a store created in key-in-environment mode. Sections below still describe upstream behaviour where they have not been touched.
+Client ID metadata documents (only dynamic registration today), forwarding an existing message's media without re-uploading, a migration path for a store created in key-in-environment mode, per-address limiting of wrong passphrases, and rate limiting of `edit_message` / `delete_message`. Binding to loopback behind a reverse proxy on the same host is rejected by the MCP library's Host check (hosted instances bind `0.0.0.0`). The Blueprint has been validated but not deployed. Sections below still describe upstream behaviour where they have not been touched.
 
 ## Structure
 

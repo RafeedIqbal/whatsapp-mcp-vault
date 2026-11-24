@@ -291,3 +291,96 @@ func TestRunLocksAnIdleInstanceByItself(t *testing.T) {
 		t.Fatal("the idle instance was never locked")
 	}
 }
+
+// A bug or a stalled network call while unlocking must not wedge the
+// instance: it has to end up locked and able to try again.
+func TestAPanicWhileUnlockingLeavesTheInstanceLockedAndRetryable(t *testing.T) {
+	explode := true
+	m := New(func(context.Context, vault.Key) (*fakeRuntime, error) {
+		if explode {
+			panic("nil map in the builder")
+		}
+		return &fakeRuntime{}, nil
+	}, 15*time.Minute)
+
+	if _, _, err := m.Acquire(context.Background(), testKey(1)); err == nil {
+		t.Fatal("Acquire reported success although unlocking panicked")
+	}
+	if m.Unlocked() {
+		t.Fatal("unlocked after a panic")
+	}
+	explode = false
+	done := make(chan error, 1)
+	go func() {
+		_, release, err := m.Acquire(context.Background(), testKey(1))
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("retry after a panic: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the instance is wedged after a panic: Acquire never returned")
+	}
+}
+
+func TestUnlockingHasADeadline(t *testing.T) {
+	var deadline time.Time
+	var has bool
+	m := New(func(ctx context.Context, _ vault.Key) (*fakeRuntime, error) {
+		deadline, has = ctx.Deadline()
+		return &fakeRuntime{}, nil
+	}, 15*time.Minute)
+	_, release, err := m.Acquire(context.Background(), testKey(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if !has || time.Until(deadline) > unlockTimeout || time.Until(deadline) <= 0 {
+		t.Fatalf("unlock ran with deadline=%v (set=%v), want one within %v", deadline, has, unlockTimeout)
+	}
+}
+
+// A request that gives up must not cancel the unlock the others wait on.
+func TestUnlockSurvivesTheFirstCallerGoingAway(t *testing.T) {
+	m := New(func(ctx context.Context, _ vault.Key) (*fakeRuntime, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return &fakeRuntime{}, nil
+	}, 15*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, release, err := m.Acquire(ctx, testKey(1)); err != nil {
+		t.Fatalf("a cancelled caller aborted the unlock: %v", err)
+	} else {
+		release()
+	}
+}
+
+type panickyRuntime struct{}
+
+func (panickyRuntime) Close() error { panic("close blew up") }
+
+func TestAPanicWhileLockingStillLeavesTheInstanceLocked(t *testing.T) {
+	m := New(func(context.Context, vault.Key) (panickyRuntime, error) { return panickyRuntime{}, nil }, 15*time.Minute)
+	_, release, err := m.Acquire(context.Background(), testKey(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	done := make(chan struct{})
+	go func() { m.Lock(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lock never returned after the runtime's Close panicked")
+	}
+	if m.Unlocked() {
+		t.Fatal("still unlocked after Lock")
+	}
+}

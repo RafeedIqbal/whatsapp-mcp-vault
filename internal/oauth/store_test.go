@@ -3,6 +3,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"os"
@@ -74,14 +75,54 @@ func TestRegisteredClientCanBeLookedUp(t *testing.T) {
 	}
 }
 
-func TestClientRegistrationIsCapped(t *testing.T) {
-	// Registration is open to anyone who can reach the server, so it must not
-	// be a way to fill the disk.
+func TestClientRegistrationEvictsUnusedClientsInsteadOfRefusing(t *testing.T) {
+	// Registration is open to anyone who can reach the server. A flood of
+	// throwaway registrations must neither fill the disk nor stop a real
+	// client (Claude) from registering.
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	first, _ := f.s.RegisterClient(ctx, "first", []string{"https://example.test/cb"})
+	inUse, _ := f.s.RegisterClient(ctx, "in use", []string{"https://example.test/cb"})
+	if _, err := f.s.IssueTokens(ctx, Grant{ClientID: inUse.ID, Scope: "whatsapp.read", Resource: "r"}, f.key); err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i < maxClients; i++ {
+		f.clock.advance(time.Second)
+		if _, err := f.s.RegisterClient(ctx, "flood", []string{"https://example.test/cb"}); err != nil {
+			t.Fatalf("registration %d: %v", i+1, err)
+		}
+	}
+	f.clock.advance(time.Second)
+	late, err := f.s.RegisterClient(ctx, "real client arriving late", []string{"https://example.test/cb"})
+	if err != nil {
+		t.Fatalf("registration at the cap was refused: %v", err)
+	}
+	if _, err := f.s.Client(ctx, late.ID); err != nil {
+		t.Fatalf("the late client is not usable: %v", err)
+	}
+	if _, err := f.s.Client(ctx, first.ID); !errors.Is(err, ErrUnknownClient) {
+		t.Fatalf("the oldest unused client was not the one evicted (err=%v)", err)
+	}
+	if _, err := f.s.Client(ctx, inUse.ID); err != nil {
+		t.Fatalf("a client with a live sign-in was evicted: %v", err)
+	}
+	var n int
+	f.s.db.QueryRow(`SELECT count(*) FROM oauth_clients`).Scan(&n)
+	if n > maxClients {
+		t.Fatalf("%d clients stored, cap is %d", n, maxClients)
+	}
+}
+
+func TestClientRegistrationRefusesOnlyWhenEveryClientIsInUse(t *testing.T) {
 	f := newStoreFixture(t)
 	ctx := context.Background()
 	for i := 0; i < maxClients; i++ {
-		if _, err := f.s.RegisterClient(ctx, "c", []string{"https://example.test/cb"}); err != nil {
-			t.Fatalf("registration %d: %v", i+1, err)
+		c, err := f.s.RegisterClient(ctx, "c", []string{"https://example.test/cb"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.s.IssueTokens(ctx, Grant{ClientID: c.ID, Scope: "whatsapp.read", Resource: "r"}, f.key); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if _, err := f.s.RegisterClient(ctx, "one too many", []string{"https://example.test/cb"}); !errors.Is(err, ErrTooManyClients) {
@@ -397,5 +438,115 @@ func TestPurgeExpiredRemovesDeadRecordsOnly(t *testing.T) {
 	}
 	if _, _, err := f.s.Authenticate(ctx, old.AccessToken); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("expired token err = %v", err)
+	}
+}
+
+// --- sealed keys of retired credentials ------------------------------------
+
+// sealedKeyOf returns what is stored for a token: its sealed key and the
+// sealed replacement pair, if any.
+func sealedKeyOf(t *testing.T, s *Store, token, prefix, purpose string) (wrapped, successor []byte, found bool) {
+	t.Helper()
+	raw, ok := parseSecret(token, prefix)
+	if !ok {
+		t.Fatalf("bad token %q", token[:12])
+	}
+	err := s.db.QueryRow(`SELECT wrapped_key, successor FROM oauth_tokens WHERE id = ?`, vault.SecretID(raw, purpose)).Scan(&wrapped, &successor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wrapped, successor, true
+}
+
+func TestARetiredRefreshTokenNoLongerOpensTheKey(t *testing.T) {
+	// The state database is readable by whoever has the disk. A refresh token
+	// that has been replaced must not, together with that database, still
+	// yield the instance key.
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	first, _ := f.s.IssueTokens(ctx, testGrant, f.key)
+	next, _ := f.s.Refresh(ctx, first.RefreshToken, testGrant.ClientID)
+
+	wrapped, successor, found := sealedKeyOf(t, f.s, first.RefreshToken, refreshPrefix, purposeRefresh)
+	if !found {
+		t.Fatal("the retired token's row is gone; reuse could no longer be detected")
+	}
+	raw, _ := parseSecret(first.RefreshToken, refreshPrefix)
+	if _, err := vault.UnwrapWithSecret(wrapped, raw, purposeRefresh); err == nil {
+		t.Fatal("the retired refresh token still opens the instance key from what is stored")
+	}
+	if len(successor) == 0 {
+		t.Fatal("no replacement is kept for a retry within the grace window")
+	}
+
+	// Once the grace window has passed, the stored replacement pair goes too.
+	f.clock.advance(refreshGrace + time.Second)
+	if err := f.s.PurgeExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, successor, _ := sealedKeyOf(t, f.s, first.RefreshToken, refreshPrefix, purposeRefresh); len(successor) != 0 {
+		t.Fatal("the replacement tokens are still stored after the grace window")
+	}
+	// The current tokens are unaffected.
+	if _, key, err := f.s.Authenticate(ctx, next.AccessToken); err != nil || key != f.key {
+		t.Fatalf("current access token broke: %v", err)
+	}
+}
+
+func TestRevokedSignInsLeaveNoSealedKeyBehind(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	a, _ := f.s.IssueTokens(ctx, testGrant, f.key)
+	b, _ := f.s.IssueTokens(ctx, testGrant, f.key)
+	bNext, _ := f.s.Refresh(ctx, b.RefreshToken, testGrant.ClientID)
+
+	// Reuse of b's first refresh token after the grace window revokes b's chain.
+	f.clock.advance(refreshGrace + time.Second)
+	f.s.Refresh(ctx, b.RefreshToken, testGrant.ClientID)
+	for _, tok := range []struct{ token, prefix, purpose string }{
+		{bNext.AccessToken, accessPrefix, purposeAccess}, {bNext.RefreshToken, refreshPrefix, purposeRefresh},
+		{b.AccessToken, accessPrefix, purposeAccess},
+	} {
+		if wrapped, _, found := sealedKeyOf(t, f.s, tok.token, tok.prefix, tok.purpose); found && len(wrapped) > 0 {
+			t.Fatal("a token of a revoked chain still has its sealed key stored")
+		}
+	}
+
+	if err := f.s.RevokeAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var withKey int
+	f.s.db.QueryRow(`SELECT count(*) FROM oauth_tokens WHERE length(wrapped_key) > 0 OR successor IS NOT NULL`).Scan(&withKey)
+	if withKey != 0 {
+		t.Fatalf("%d token rows still hold a sealed key after RevokeAll", withKey)
+	}
+	if _, _, err := f.s.Authenticate(ctx, a.AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token survives RevokeAll (err=%v)", err)
+	}
+}
+
+func TestOnlyTheExactTokenStringIsAccepted(t *testing.T) {
+	// 32 bytes encode to 43 base64 characters with two bits to spare, so a
+	// lenient decoder accepts four spellings of the same token. Only the one
+	// that was issued may work.
+	f := newStoreFixture(t)
+	pair, _ := f.s.IssueTokens(context.Background(), testGrant, f.key)
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	last := pair.AccessToken[len(pair.AccessToken)-1]
+	accepted := 0
+	for i := 0; i < len(alphabet); i++ {
+		candidate := pair.AccessToken[:len(pair.AccessToken)-1] + string(alphabet[i])
+		if _, _, err := f.s.Authenticate(context.Background(), candidate); err == nil {
+			accepted++
+			if alphabet[i] != last {
+				t.Errorf("a different spelling of the token was accepted (last character %q instead of %q)", alphabet[i], last)
+			}
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("%d spellings of the access token were accepted, want exactly 1", accepted)
 	}
 }

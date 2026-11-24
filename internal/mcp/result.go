@@ -8,6 +8,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/sealjay/mcp-whatsapp/internal/client"
+	"github.com/sealjay/mcp-whatsapp/internal/ingest"
 )
 
 // resultJSON serialises v to JSON and wraps it in a text tool result.
@@ -30,20 +31,35 @@ const inlineMediaMaxBytes = 5 * 1024 * 1024
 type mediaSummary struct {
 	client.DownloadResult
 	Note string `json:"note,omitempty"`
+	// DownloadURL is a one-time link for media too large to return in the
+	// result itself.
+	DownloadURL       string `json:"download_url,omitempty"`
+	DownloadExpiresIn int    `json:"download_expires_in_seconds,omitempty"`
 }
 
 // downloadMediaResult builds the CallToolResult returned by the download_media
-// tool. The first content block is always the JSON summary. For a successful
+// tool. Media over inlineMediaMaxBytes is offered as a one-time download link
+// when a file service is available. The first content block is always the JSON summary. For a successful
 // download of at most inlineMediaMaxBytes the bytes follow in a second block:
 // an ImageContent or AudioContent for images and audio, and an embedded
 // resource (addressed by uri) for videos and documents, which have no content
 // type of their own.
-func downloadMediaResult(r client.DownloadResult, uri string) (*mcp.CallToolResult, error) {
+func downloadMediaResult(r client.DownloadResult, uri string, files *Files) (*mcp.CallToolResult, error) {
 	sum := mediaSummary{DownloadResult: r}
 	var media mcp.Content
 	if r.Success && len(r.Data) > 0 {
 		if len(r.Data) > inlineMediaMaxBytes {
 			sum.Note = fmt.Sprintf("media is too large to return (%d bytes; the limit is %d)", len(r.Data), inlineMediaMaxBytes)
+			if files != nil && files.Transfers != nil {
+				_, link, err := files.Transfers.OfferDownload(ingest.Blob{Filename: r.Filename, ContentType: sniffResourceMIME(r.Data, r.MediaType), Data: r.Data})
+				if err == nil {
+					sum.DownloadURL = link
+					sum.DownloadExpiresIn = int(files.Transfers.TTL().Seconds())
+					sum.Note = "media is too large to return here; give the user download_url, which works once and expires soon"
+				} else {
+					sum.Note += "; a download link could not be created: " + err.Error()
+				}
+			}
 		} else {
 			media = inlineMedia(r, uri)
 		}

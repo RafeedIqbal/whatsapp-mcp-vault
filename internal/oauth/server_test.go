@@ -602,3 +602,23 @@ func TestAuthenticateRejectsMissingMalformedAndWrongAudienceTokens(t *testing.T)
 		t.Error("token for another resource authenticated")
 	}
 }
+
+// --- flooding --------------------------------------------------------------
+
+func TestAFloodOfConsentPagesDoesNotBlockARealSignIn(t *testing.T) {
+	// Opening the consent page needs no credentials. Filling the server with
+	// abandoned ones must push out the oldest, not refuse the newest.
+	f := newServerFixture(t)
+	clientID := f.register(claudeCallback)
+	stale := f.consent(clientID, claudeCallback, nil)
+	for i := 0; i < maxPendingConsents; i++ {
+		f.consent(clientID, claudeCallback, nil)
+	}
+	fresh := f.consent(clientID, claudeCallback, nil)
+	if resp, loc, body := f.approve(fresh, testPassphrase, "whatsapp.read"); resp.StatusCode != http.StatusFound || loc.Query().Get("code") == "" {
+		t.Fatalf("sign-in after a flood of consent pages failed: %d %s", resp.StatusCode, body)
+	}
+	if resp, _, _ := f.approve(stale, testPassphrase, "whatsapp.read"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("the oldest consent page was not the one dropped: status %d", resp.StatusCode)
+	}
+}

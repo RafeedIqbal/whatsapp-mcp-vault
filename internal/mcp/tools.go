@@ -5,7 +5,9 @@ import "strings"
 // Every tool is explicitly reviewed; unknown tools fail closed in read-only mode.
 var readOnlyToolAccess = map[string]bool{
 	"block_contact":             false,
+	"confirm_send":              false,
 	"create_group":              false,
+	"create_upload_link":        false,
 	"delete_message":            false,
 	"download_media":            true,
 	"edit_message":              false,

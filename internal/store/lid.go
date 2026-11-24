@@ -51,3 +51,17 @@ func (s *Store) ResolveJIDToPhone(jid string) string {
 	}
 	return ""
 }
+
+// ResolveJIDToLID is the reverse of ResolveLIDToJID: for a phone-number JID it
+// returns the hidden-ID JID WhatsApp maps it to, or "" when there is none.
+func (s *Store) ResolveJIDToLID(jid string) string {
+	if !strings.HasSuffix(jid, "@s.whatsapp.net") || s.whatsmeowDB == nil {
+		return ""
+	}
+	phone, _, _ := strings.Cut(jidUser(jid), ":")
+	var lid string
+	if err := s.whatsmeowDB.QueryRow("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", phone).Scan(&lid); err != nil || lid == "" {
+		return ""
+	}
+	return lid + "@lid"
+}

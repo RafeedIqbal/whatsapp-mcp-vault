@@ -82,7 +82,8 @@ func newFixture(t *testing.T, opts ...fixtureOpt) *fixture {
 	}, 15*time.Minute)
 	cfg := Config[*fakeRuntime]{
 		Meta:       meta,
-		OAuth:      oauth.NewServer(oauth.Config{Issuer: testIssuer, Store: f.store, Unlock: meta.UnlockWithPassphrase}),
+		OAuth:      oauth.NewServer(oauth.Config{Issuer: testIssuer, Store: f.store, Unlock: meta.Unlock}),
+		RevokeAll:  f.store.RevokeAll,
 		Sessions:   f.sessions,
 		SetupToken: testSetupToken,
 		Now:        func() time.Time { return f.now },
@@ -508,5 +509,189 @@ func TestOwnerPagesRefuseRequestsCausedByAnotherSite(t *testing.T) {
 	same.Header.Set("Origin", f.srv.URL)
 	if resp, body := do(t, b, same); resp.StatusCode != http.StatusOK || body != "owner:/pair/reset" {
 		t.Fatalf("same-site POST: status %d body %q", resp.StatusCode, body)
+	}
+}
+
+// Upload pages and download links are served by the front door itself, with
+// no sign-in (their one-time address is the permission) and without waking a
+// locked instance.
+func TestExtraRoutesAreServedWithoutUnlocking(t *testing.T) {
+	f := newFixture(t, func(c *Config[*fakeRuntime]) {
+		c.Extra = func(mux *http.ServeMux) {
+			mux.HandleFunc("GET /upload/{id}", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "upload:"+r.PathValue("id")) })
+		}
+	})
+	resp, body := f.get(http.DefaultClient, "/upload/abc")
+	if resp.StatusCode != http.StatusOK || body != "upload:abc" {
+		t.Fatalf("status %d body %q", resp.StatusCode, body)
+	}
+	if f.builds.Load() != 0 {
+		t.Fatal("an upload page request unlocked the instance")
+	}
+}
+
+// --- owner key lifetime ----------------------------------------------------
+
+// An owner sign-in keeps the key in memory so the pairing pages work. It must
+// be dropped when idle even if the owner simply closes the tab and never
+// sends another request.
+func TestOwnerKeyIsForgottenWhenIdleWithNoFurtherRequest(t *testing.T) {
+	f := newFixture(t)
+	f.setUp()
+	if n := f.gw.ownerCount(); n != 1 {
+		t.Fatalf("owner sessions after setup = %d, want 1", n)
+	}
+	f.now = f.now.Add(ownerIdle - time.Minute)
+	f.gw.ExpireOwners()
+	if f.gw.ownerCount() != 1 {
+		t.Fatal("an owner session was dropped before it was idle")
+	}
+	f.now = f.now.Add(2 * time.Minute)
+	f.gw.ExpireOwners()
+	if n := f.gw.ownerCount(); n != 0 {
+		t.Fatalf("%d owner session(s) still hold the key after the idle period", n)
+	}
+}
+
+func (f *fixture) ownerAction(b *http.Client, form url.Values) (*http.Response, string) {
+	return f.post(b, "/setup", form)
+}
+
+func TestLockNowForgetsOwnerKeysAndLocksTheInstance(t *testing.T) {
+	f := newFixture(t)
+	b, _ := f.setUp()
+	f.get(b, "/pair") // unlocks
+	if !f.sessions.Unlocked() {
+		t.Fatal("precondition: unlocked")
+	}
+	resp, _ := f.ownerAction(b, url.Values{"action": {"lock"}})
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("lock: status %d", resp.StatusCode)
+	}
+	if f.sessions.Unlocked() || f.gw.ownerCount() != 0 {
+		t.Fatalf("after lock now: unlocked=%v owner sessions=%d", f.sessions.Unlocked(), f.gw.ownerCount())
+	}
+	if resp, _ := f.get(b, "/pair"); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("the owner pages still open after lock now: status %d", resp.StatusCode)
+	}
+}
+
+func TestOwnerCanSignOut(t *testing.T) {
+	f := newFixture(t)
+	b, _ := f.setUp()
+	if resp, _ := f.ownerAction(b, url.Values{"action": {"logout"}}); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout: status %d", resp.StatusCode)
+	}
+	if f.gw.ownerCount() != 0 {
+		t.Fatal("sign-out left the key in memory")
+	}
+	if resp, _ := f.get(b, "/pair"); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("owner pages open after sign-out: status %d", resp.StatusCode)
+	}
+}
+
+// --- recovery, passphrase change, revoking sign-ins ------------------------
+
+func recoveryCodeFrom(t *testing.T, page string) string {
+	t.Helper()
+	m := recoveryPattern.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatal("no recovery code on the setup page")
+	}
+	return m[1]
+}
+
+func TestRecoveryCodeSetsANewPassphrase(t *testing.T) {
+	f := newFixture(t)
+	_, page := f.setUp()
+	code := recoveryCodeFrom(t, page)
+	before, _ := f.meta.UnlockWithPassphrase(context.Background(), testPassphrase)
+	const next = "a brand new passphrase after recovery"
+
+	b := f.browser()
+	if resp, _ := f.post(b, "/setup", url.Values{"action": {"recover"}, "recovery_code": {"AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA"}, "passphrase": {next}, "confirm": {next}}); resp.StatusCode != http.StatusOK || ownerCookie(resp) != nil {
+		t.Fatalf("wrong recovery code: status %d cookie=%v", resp.StatusCode, ownerCookie(resp))
+	}
+	if resp, _ := f.post(b, "/setup", url.Values{"action": {"recover"}, "recovery_code": {code}, "passphrase": {next}, "confirm": {"something else entirely"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("mismatched new passphrase: status %d", resp.StatusCode)
+	}
+	resp, _ := f.post(b, "/setup", url.Values{"action": {"recover"}, "recovery_code": {strings.ToLower(code)}, "passphrase": {next}, "confirm": {next}})
+	if resp.StatusCode != http.StatusSeeOther || ownerCookie(resp) == nil {
+		t.Fatalf("recovery: status %d", resp.StatusCode)
+	}
+	if _, err := f.meta.UnlockWithPassphrase(context.Background(), testPassphrase); !errors.Is(err, vault.ErrWrongSecret) {
+		t.Fatalf("the forgotten passphrase still works (err=%v)", err)
+	}
+	after, err := f.meta.UnlockWithPassphrase(context.Background(), next)
+	if err != nil || after != before {
+		t.Fatalf("new passphrase: same key=%v err=%v", after == before, err)
+	}
+}
+
+func TestRecoveryWorksWhilePassphraseSignInIsPaused(t *testing.T) {
+	f := newFixture(t)
+	_, page := f.setUp()
+	code := recoveryCodeFrom(t, page)
+	for i := 0; i < 6; i++ {
+		f.post(f.browser(), "/setup", url.Values{"action": {"login"}, "passphrase": {"a wrong guess from someone"}})
+	}
+	if resp, body := f.post(f.browser(), "/setup", url.Values{"action": {"login"}, "passphrase": {testPassphrase}}); resp.StatusCode == http.StatusSeeOther {
+		t.Fatalf("precondition: passphrase sign-in should be paused, got %d %s", resp.StatusCode, body)
+	}
+	// The recovery code signs the owner in directly...
+	if resp, _ := f.post(f.browser(), "/setup", url.Values{"action": {"login"}, "passphrase": {code}}); resp.StatusCode != http.StatusSeeOther || ownerCookie(resp) == nil {
+		t.Fatalf("recovery code at sign-in during a pause: status %d", resp.StatusCode)
+	}
+	// ...and can set a new passphrase.
+	const next = "a new passphrase set during the pause"
+	if resp, _ := f.post(f.browser(), "/setup", url.Values{"action": {"recover"}, "recovery_code": {code}, "passphrase": {next}, "confirm": {next}}); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("recovery during a pause: status %d", resp.StatusCode)
+	}
+}
+
+func TestOwnerCanChangeThePassphrase(t *testing.T) {
+	f := newFixture(t)
+	b, _ := f.setUp()
+	const next = "the owner chose another passphrase"
+
+	// Not signed in: nothing changes.
+	if resp, _ := f.post(f.browser(), "/setup", url.Values{"action": {"change"}, "passphrase": {next}, "confirm": {next}}); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("change without sign-in: status %d", resp.StatusCode)
+	}
+	if _, err := f.meta.UnlockWithPassphrase(context.Background(), testPassphrase); err != nil {
+		t.Fatalf("an anonymous request changed the passphrase: %v", err)
+	}
+
+	if resp, _ := f.ownerAction(b, url.Values{"action": {"change"}, "passphrase": {next}, "confirm": {"mismatch here"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("mismatch: status %d", resp.StatusCode)
+	}
+	if resp, body := f.ownerAction(b, url.Values{"action": {"change"}, "passphrase": {next}, "confirm": {next}}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("change: status %d %s", resp.StatusCode, body)
+	}
+	if _, err := f.meta.UnlockWithPassphrase(context.Background(), next); err != nil {
+		t.Fatalf("new passphrase does not work: %v", err)
+	}
+	if _, err := f.meta.UnlockWithPassphrase(context.Background(), testPassphrase); !errors.Is(err, vault.ErrWrongSecret) {
+		t.Fatalf("old passphrase still works (err=%v)", err)
+	}
+}
+
+func TestOwnerCanSignEveryAppOut(t *testing.T) {
+	f := newFixture(t, func(c *Config[*fakeRuntime]) {})
+	b, _ := f.setUp()
+	tok := f.token("whatsapp.read")
+	if resp, _ := f.mcp(tok); resp.StatusCode != http.StatusOK {
+		t.Fatal("precondition: token works")
+	}
+	// Not signed in: tokens are untouched.
+	f.post(f.browser(), "/setup", url.Values{"action": {"revoke"}})
+	if resp, _ := f.mcp(tok); resp.StatusCode != http.StatusOK {
+		t.Fatal("an anonymous request revoked the tokens")
+	}
+	if resp, body := f.ownerAction(b, url.Values{"action": {"revoke"}}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke: status %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := f.mcp(tok); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a token still works after the owner signed every app out: status %d", resp.StatusCode)
 	}
 }

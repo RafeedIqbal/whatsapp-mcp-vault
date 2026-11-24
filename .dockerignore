@@ -9,3 +9,5 @@ cover.out
 claude_desktop_config.json
 docs/superpowers
 .superpowers/
+.local/
+.claude/

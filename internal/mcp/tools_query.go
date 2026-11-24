@@ -125,7 +125,7 @@ func (s *Server) registerListMessages() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		out := s.client.Store().FormatMessagesList(ctx, msgs, true)
+		out := withUntrustedNotice(s.client.Store().FormatMessagesList(ctx, msgs, true))
 		if next != "" {
 			out += "next_cursor: " + next + "\n"
 		}
@@ -254,7 +254,6 @@ func (s *Server) registerIsOnWhatsApp() {
 		if len(a.Phones) == 0 {
 			return mcp.NewToolResultError("phones must not be empty"), nil
 		}
-		ctx = withRateLimitOverride(ctx, req)
 		m, err := s.client.IsOnWhatsApp(ctx, a.Phones)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil

@@ -23,20 +23,27 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get inst
 
 RUN useradd -r -u 10001 -m app
 COPY --from=build /out/whatsapp-mcp /usr/local/bin/whatsapp-mcp
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh && mkdir -p /home/app/store && chown -R app:app /home/app
 
-USER app
 WORKDIR /home/app
-RUN mkdir -p /home/app/store
 
-# Loopback-only by default, matching the binary's own default. To host it,
-# override CMD with `serve -addr 0.0.0.0:8765 -allow-remote` and set
-# PUBLIC_URL (the https address clients use) and SETUP_TOKEN (the one-time
-# code the owner enters at /setup). Do not set WHATSAPP_MCP_VAULT_KEY when
-# hosting: the key is created at setup and never stored in usable form.
+# The container starts as root only so the entrypoint can take ownership of a
+# mounted data disk (hosts mount them root-owned); it then drops to the
+# unprivileged user "app" before the server starts and cannot get root back.
+#
+# Loopback-only by default, matching the binary's own default. To host it, set:
+#   WHATSAPP_MCP_ADDR=0.0.0.0:<port>   where to listen
+#   WHATSAPP_MCP_ALLOW_REMOTE=1        allow connections from outside
+#   PUBLIC_URL=https://...             the address clients use (Render sets
+#                                      RENDER_EXTERNAL_URL, which is used if unset)
+#   SETUP_TOKEN=<random>               one-time code the owner enters at /setup
+# Do not set WHATSAPP_MCP_VAULT_KEY when hosting: the key is created at setup
+# and never stored in usable form. See docs/hosting.md.
 EXPOSE 8765
 VOLUME ["/home/app/store"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["whatsapp-mcp", "healthcheck"]
 
-ENTRYPOINT ["whatsapp-mcp", "-store", "/home/app/store"]
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["serve"]

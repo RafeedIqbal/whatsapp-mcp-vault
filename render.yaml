@@ -1,0 +1,47 @@
+# Render Blueprint: one private WhatsApp MCP instance per person.
+#
+# Each person gets their own service, disk, address and setup code. Nothing is
+# shared between instances. To add someone, copy the whole service block below,
+# change `name` and the disk `name`, and sync the Blueprint.
+#
+# After the first deploy:
+#   1. Copy the service's SETUP_TOKEN from its Environment page in the Render
+#      dashboard and give it, with the service's address, to that person.
+#   2. They open https://<service>.onrender.com/setup, enter the setup code,
+#      choose a passphrase, save the recovery code and link WhatsApp.
+#   3. In Claude they add https://<service>.onrender.com/mcp as a custom
+#      connector and approve it with their passphrase.
+#
+# See docs/hosting.md for details and for what the host can and cannot see.
+
+services:
+  - type: web
+    name: wa-yourname
+    runtime: docker
+    plan: starter
+    # Pick the region nearest the person: oregon, ohio, virginia, frankfurt, singapore.
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    # Deploy only when you choose to: an update restarts the instance, and
+    # WhatsApp protocol updates should be tested before they reach everyone.
+    autoDeployTrigger: "off"
+    disk:
+      name: wa-yourname-store
+      mountPath: /home/app/store
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: WHATSAPP_MCP_ADDR
+        value: 0.0.0.0:10000
+      - key: WHATSAPP_MCP_ALLOW_REMOTE
+        value: "1"
+      # One-time code for /setup. Render generates it; read it in the dashboard.
+      - key: SETUP_TOKEN
+        generateValue: true
+      # How long the instance stays unlocked without use.
+      - key: IDLE_LOCK
+        value: 15m
+      # PUBLIC_URL is not needed on Render: RENDER_EXTERNAL_URL is used.
+      # With a custom domain, set PUBLIC_URL to that https address.

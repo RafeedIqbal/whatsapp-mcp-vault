@@ -170,7 +170,8 @@ func (m *Meta) Initialize(ctx context.Context, passphrase string) (Key, string, 
 
 // UnlockWithPassphrase returns the instance key if passphrase is right. Wrong
 // guesses are counted, and after maxFreeAttempts in a row further attempts are
-// refused (with *LockedOutError) for a growing period.
+// refused (with *LockedOutError) for a growing period. The recovery code is
+// not affected by that pause.
 func (m *Meta) UnlockWithPassphrase(ctx context.Context, passphrase string) (Key, error) {
 	return m.attempt(ctx, func(st vaultState) (Key, error) {
 		m.derivations++
@@ -179,15 +180,37 @@ func (m *Meta) UnlockWithPassphrase(ctx context.Context, passphrase string) (Key
 }
 
 // UnlockWithRecoveryCode returns the instance key if code is the recovery code
-// issued at setup. It shares the wrong-guess limit with the passphrase.
+// issued at setup. It is not subject to the wrong-guess pause and does not add
+// to it: the code is 160 random bits, so guessing it is not a risk, and it is
+// the owner's way in when someone else's wrong guesses have paused sign-in.
 func (m *Meta) UnlockWithRecoveryCode(ctx context.Context, code string) (Key, error) {
-	return m.attempt(ctx, func(st vaultState) (Key, error) {
-		raw, err := RecoveryCodeBytes(code)
-		if err != nil {
-			return Key{}, ErrWrongSecret
+	raw, err := RecoveryCodeBytes(code)
+	if err != nil {
+		if ok, ierr := m.Initialized(ctx); ierr == nil && !ok {
+			return Key{}, ErrNotInitialized
 		}
-		return UnwrapWithSecret(st.recovery, raw, recoveryPurpose)
-	})
+		return Key{}, ErrWrongSecret
+	}
+	st, err := m.load(ctx)
+	if err != nil {
+		return Key{}, err
+	}
+	return UnwrapWithSecret(st.recovery, raw, recoveryPurpose)
+}
+
+// Unlock returns the instance key for either secret the owner holds: the
+// passphrase or the recovery code. Something shaped like a recovery code is
+// tried as one first (which costs nothing and is never paused) and, if it is
+// not the code, as a passphrase.
+func (m *Meta) Unlock(ctx context.Context, secret string) (Key, error) {
+	if _, err := RecoveryCodeBytes(secret); err == nil {
+		if key, err := m.UnlockWithRecoveryCode(ctx, secret); err == nil {
+			return key, nil
+		} else if !errors.Is(err, ErrWrongSecret) {
+			return Key{}, err
+		}
+	}
+	return m.UnlockWithPassphrase(ctx, secret)
 }
 
 // ChangePassphrase replaces the passphrase. The caller proves ownership by

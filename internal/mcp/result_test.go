@@ -59,7 +59,7 @@ func summary(t *testing.T, res *mcp.CallToolResult) map[string]any {
 
 func mustResult(t *testing.T, r client.DownloadResult) *mcp.CallToolResult {
 	t.Helper()
-	res, err := downloadMediaResult(r, testMediaURI)
+	res, err := downloadMediaResult(r, testMediaURI, nil)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}

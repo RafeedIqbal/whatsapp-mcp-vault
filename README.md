@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **This is a work-in-progress fork of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp)** (MIT), being reworked into a hosted server where each person runs their own private instance and everything on disk is encrypted. It is not affiliated with the upstream project, WhatsApp or Meta.
 >
-> What has changed so far, and what has not been built yet, is listed under "Fork status" in [AGENTS.md](AGENTS.md). The rest of this README, including the badges and install instructions below, still describes the upstream project and has not been updated.
+> To host it, see [docs/hosting.md](docs/hosting.md). What has changed, and what has not been built yet, is listed under "Fork status" in [AGENTS.md](AGENTS.md). The rest of this README, including the badges and install instructions below, still describes the upstream project and has not been updated.
 >
 > This server links to WhatsApp as an unofficial linked device. That is against WhatsApp's Terms of Service and can get an account restricted or banned. Use it at your own risk.
 
@@ -244,25 +244,19 @@ Global flags go **before** the subcommand: `./bin/whatsapp-mcp -store /path/to/s
 `serve` flags:
 
 - `-addr host:port` (env `WHATSAPP_MCP_ADDR`, default `127.0.0.1:8765`).
-- `-allow-remote`: bind a non-loopback address. Requires `WHATSAPP_MCP_TOKEN`, a bearer token for `/mcp` and `/pair/*`; `serve` exits without it. The flag enables the bind but does not configure TLS. When exposing the daemon beyond loopback, use an HTTPS reverse proxy and keep the daemon's upstream on loopback HTTP.
+- `-allow-remote` (env `WHATSAPP_MCP_ALLOW_REMOTE=1`): bind a non-loopback address. This is only possible in passphrase sign-in mode (no `WHATSAPP_MCP_VAULT_KEY`), where every request to `/mcp` needs an OAuth access token; it needs `PUBLIC_URL` and `SETUP_TOKEN`. The flag enables the bind but does not configure TLS: put HTTPS in front. See [docs/hosting.md](docs/hosting.md).
 - `-read-only` (env `WHATSAPP_MCP_READ_ONLY=1`): see [Tool availability by mode](#tool-availability-by-mode). `get_status` reports `read_only`, and MCP instructions report the mode. `-read-only=false` overrides an enabled environment setting; invalid environment values stop startup rather than silently enabling mutation tools.
 - `-enable-labels` (env `WHATSAPP_MCP_LABELS=1`, default off): enable WhatsApp Business label event capture, one-time initial sync, and four read-only label tools. The flag is set before connecting; it is not changed during a live sync.
 - `-full-history` (env `WHATSAPP_MCP_FULL_HISTORY`): ask for a full history sync when pairing through `/pair`. Also accepted by `login` (see [Full history at pairing](#full-history-at-pairing)).
 
 Environment only:
 
-- `WHATSAPP_MCP_MEDIA_ROOT`: the allowlist root for user-supplied file paths (see [Sending and receiving files](#sending-and-receiving-files)).
+- `WHATSAPP_MCP_VAULT_KEY`: 64 hex characters (`openssl rand -hex 32`). Selects the local development mode: the store is encrypted under this key, there is no sign-in, and the daemon only listens on loopback. Leave it unset to use passphrase sign-in, which is what a hosted instance uses.
+- `PUBLIC_URL`, `SETUP_TOKEN`, `IDLE_LOCK`, `ALLOW_NEW_RECIPIENTS`, `SEND_CONFIRM`, `OAUTH_REDIRECT_ALLOWLIST`: see [docs/hosting.md](docs/hosting.md).
 - `WHATSAPP_MCP_TRANSCRIBE_URL`: enables `transcribe_audio`. Base URL of a speech-to-text service that implements the OpenAI-compatible `POST /v1/audio/transcriptions` (a local whisper.cpp or faster-whisper server, LocalAI, or a hosted API). Unset = feature off. Loopback HTTP endpoints are allowed; non-loopback endpoints require HTTPS and explicit opt-in with `WHATSAPP_MCP_TRANSCRIBE_ALLOW_REMOTE=1`. That opt-in sends audio to another service, so use a trusted endpoint. HTTP redirects are refused; configure the final transcription endpoint directly.
   Optional: `WHATSAPP_MCP_TRANSCRIBE_MODEL`, `WHATSAPP_MCP_TRANSCRIBE_LANGUAGE` (ISO 639-1; empty = autodetect), `WHATSAPP_MCP_TRANSCRIBE_TOKEN` (bearer token for the service), `WHATSAPP_MCP_TRANSCRIBE_MAX_SECONDS` (default 600). Ogg/Opus duration is checked before upload; malformed streams are rejected. Other formats rely on the service's duration limit. Transcripts are third-party content and are cached in `messages.db`. The first transcript is reused; changing the model or language affects only messages without a cached transcript.
 
-For remote clients, put an HTTPS reverse proxy in front of the daemon and start its loopback upstream with token authentication:
-
-```bash
-WHATSAPP_MCP_TOKEN="$TOKEN" ./bin/whatsapp-mcp serve \
-  -addr 127.0.0.1:8765 -allow-remote
-```
-
-Set `TOKEN` to your secret bearer token. `-allow-remote` activates token authentication even on loopback; without it, the daemon ignores `WHATSAPP_MCP_TOKEN`. The proxy must forward the `Authorization` header. Configure the client to use `https://whatsapp.example.com/mcp` with that bearer token.
+For remote clients (Claude on the web or phone), host the server in passphrase sign-in mode. There is no shared bearer token: each client signs in through OAuth and the owner approves it with their passphrase. See [docs/hosting.md](docs/hosting.md).
 
 For an archive or summarisation client, start with the explicit read-only mode:
 
@@ -272,18 +266,12 @@ For an archive or summarisation client, start with the explicit read-only mode:
 
 ## Sending and receiving files
 
-`WHATSAPP_MCP_MEDIA_ROOT` (default `<store>/uploads/`, created on first run) is the only directory the tools may touch for **user-supplied** send and output paths. The managed download cache lives separately under the store.
+No tool reads or writes a path on the server, and decrypted media is never written to disk.
 
-- **Sending:** `send_file` and `send_audio_message` take a `media_path` under the root.
-- **Receiving:** `download_media` caches to `<store>/<chat_jid>/<hex(message_id)>/<safe_filename>` (checked against the stored size and SHA-256). An optional `output_path` also writes a separate copy under the root. An existing file there is never replaced: the call succeeds without downloading again if that file already holds this media, and fails otherwise.
+- **Sending:** `send_file` and `send_audio_message` take exactly one of `url` (a public https link the server downloads; private and local addresses are refused), `upload_id` (from `create_upload_link`, a one-time page where the user uploads a file from their own device), or `data_base64` with `filename` (small files, up to 5 MB).
+- **Receiving:** `download_media` fetches and decrypts in memory. Images and audio come back as image or audio content, documents and videos up to 5 MiB as an embedded resource, and anything larger as `download_url`, a one-time link that expires after ten minutes. Nothing is cached: every call fetches again.
 - **MCP resource:** `whatsapp://media/{chat_jid}/{message_id}` returns the media bytes over MCP, downloading (and, for expired links, asking your phone to re-upload) when needed. It is available in read-only mode.
-- **Expired media links:** media links from history sync carry a signed expiry and usually fail with HTTP 403 by the time you ask. `download_media` (and reads of the `whatsapp://media/…` resource) then asks the account's own phone to re-upload the file (WhatsApp's media retry receipt, the same request WhatsApp Web sends), waits up to 30 seconds for the answer, and downloads once more. The link is saved only after whatsmeow decrypts the payload and its size and SHA-256 match the cached message. This explicit recovery also works in read-only mode; the request goes only to your own phone, with no notification to the sender or chat. The phone must be online; media it has deleted cannot be recovered. This happens only for the message you asked for, never in bulk.
-
-Paths outside the root, including symlinks that resolve outside it, are rejected. Anything inside the root is readable and writable by the tools, so keep secrets out.
-
-**Sandboxed clients (Claude Cowork and similar)** cannot read the daemon's cache. Point `WHATSAPP_MCP_MEDIA_ROOT` at a directory the sandbox can read and give the client this instruction:
-
-> When calling the WhatsApp MCP's `download_media`, always pass `output_path` set to a path under your shared workspace. Without it the decrypted file lands only in the daemon's local cache, which is outside your sandbox and unreadable. `output_path` must live under `WHATSAPP_MCP_MEDIA_ROOT` on the daemon side; the basename is yours to pick.
+- **Expired media links:** media links from history sync carry a signed expiry and usually fail with HTTP 403 by the time you ask. `download_media` (and reads of the `whatsapp://media/…` resource) then asks the account's own phone to re-upload the file and retries once; the phone must be online.
 
 ### Edits and deletions
 
@@ -302,7 +290,7 @@ Encrypted poll votes received through history sync are saved until the poll and 
 
 A file lock on `store/.lock` allows one `serve` or `login` process per store. Multiple MCP clients can share that daemon and its WhatsApp session.
 
-For monitoring, `GET /healthz` returns `200 {"ok":true}` while the HTTP server is alive. `GET /readyz` returns `200 {"ready":true}` only while paired and connected, or `503 {"ready":false}` otherwise (not paired, or disconnected). Both are unauthenticated, even with `-allow-remote`, and expose no account identifiers; restrict network access to the listener as needed. `get_status` also reports `connection_state` and `connection_state_since`, including logged-out, replaced, outdated, temporary-ban and connection-failure events. A keepalive timeout is reported until restored or disconnected; it does not itself mean the socket has closed.
+For monitoring, `GET /healthz` returns `200 {"ok":true}` while the HTTP server is alive. `GET /readyz` returns `200 {"ready":true}` only while paired and connected, or `503 {"ready":false}` otherwise (not paired, or disconnected). Both are unauthenticated, even with `-allow-remote`, and expose no account identifiers; restrict network access to the listener as needed. `get_status` also reports `connection_state` and `connection_state_since`, including logged-out, replaced, outdated, temporary-ban and connection-failure events. A keepalive timeout is reported until restored or disconnected; it does not itself mean the socket has closed. In passphrase sign-in mode both probes return `200` whenever the process is up: a locked instance is the normal resting state.
 
 Run `whatsapp-mcp healthcheck` to probe readiness without curl. It uses `WHATSAPP_MCP_ADDR` or `127.0.0.1:8765`; `healthcheck -addr 127.0.0.1:PORT` overrides either. Only loopback and wildcard bind addresses are accepted, and wildcard addresses are probed via loopback. Exit status is 0 for ready, 1 for unavailable or unready, and 2 for invalid arguments. It never opens the store or sends a bearer token.
 
@@ -313,18 +301,19 @@ Run `whatsapp-mcp healthcheck` to probe readiness without curl. It uses `WHATSAP
 | Claude Code hook | Put `docs/hooks/setup.sh` in `.claude/hooks/` and call it from `settings.json` (idempotent) |
 | Manual | `./bin/whatsapp-mcp serve` |
 
-**Docker (local access).** The image (`debian:bookworm-slim` plus ffmpeg, a few hundred MB) runs `-store /home/app/store`; persist that volume. This example publishes the host port on loopback only; do not expose it directly on a public interface. For remote clients, use an HTTPS reverse proxy and keep the daemon on loopback HTTP. Pair with a one-off `login` container first, because `login` and a running `serve` cannot share the store lock:
+**Docker (local access).** The image (`debian:bookworm-slim` plus ffmpeg, a few hundred MB) keeps its data in `/home/app/store`; persist that volume. A container has to listen beyond its own loopback for a published port to work, so it runs in passphrase sign-in mode even locally. This example publishes the port on the host's loopback only. To host it for remote clients, see [docs/hosting.md](docs/hosting.md).
 
 ```bash
 docker build -t whatsapp-mcp --build-arg VERSION=$(git describe --tags --always) .
-docker run --rm -it -v whatsapp-mcp-store:/home/app/store whatsapp-mcp login
-TOKEN=$(openssl rand -hex 32); echo "$TOKEN"
+SETUP=$(openssl rand -hex 16); echo "setup code: $SETUP"
 docker run -d --name whatsapp-mcp -v whatsapp-mcp-store:/home/app/store \
-  -p 127.0.0.1:8765:8765 -e WHATSAPP_MCP_TOKEN="$TOKEN" \
-  whatsapp-mcp serve -addr 0.0.0.0:8765 -allow-remote
+  -p 127.0.0.1:8765:8765 \
+  -e WHATSAPP_MCP_ADDR=0.0.0.0:8765 -e WHATSAPP_MCP_ALLOW_REMOTE=1 \
+  -e PUBLIC_URL=http://localhost:8765 -e SETUP_TOKEN="$SETUP" \
+  whatsapp-mcp
 ```
 
-Clients on the host send `Authorization: Bearer $TOKEN`. The daemon listens on the container interface so Docker can forward the port; the host-side mapping restricts access to loopback. Do not use this plain-HTTP setup for remote access. To re-pair, stop the serving container, rerun the `login` container and start it again.
+Then open `http://localhost:8765/setup`, enter the setup code, choose a passphrase and link WhatsApp. MCP clients on the host connect to `http://localhost:8765/mcp` and sign in through the browser.
 
 The image includes a readiness `HEALTHCHECK`. Set `WHATSAPP_MCP_ADDR` to the same wildcard or loopback address used by `serve` when changing the port; a `serve -addr` flag is not visible to the separate health-check process. For a daemon bound to a specific non-loopback interface, disable the image health check and monitor the listener externally.
 

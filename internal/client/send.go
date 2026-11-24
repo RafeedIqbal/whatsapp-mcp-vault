@@ -2,9 +2,9 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"mime"
-	"os"
 	"strings"
 	"time"
 
@@ -32,22 +32,36 @@ type SendResult struct {
 type SendMediaOptions struct {
 	Recipient string
 	Caption   string
-	MediaPath string
-	ViewOnce  bool
+	// Filename names the attachment; its extension decides how WhatsApp
+	// shows it (photo, video, voice note or document).
+	Filename string
+	// Data is the attachment itself. It is uploaded from memory; nothing is
+	// read from or written to the server's disk.
+	Data     []byte
+	ViewOnce bool
+}
+
+// attachment is a file to send, held in memory.
+type attachment struct {
+	name string
+	data []byte
 }
 
 // Send sends a text message.
 func (c *Client) Send(ctx context.Context, recipient, message string) SendResult {
-	return c.send(ctx, recipient, message, "", false)
+	return c.send(ctx, recipient, message, nil, false)
 }
 
 // SendMediaWithOptions is the extensible entry point for media sends.
 func (c *Client) SendMediaWithOptions(ctx context.Context, opts SendMediaOptions) SendResult {
-	return c.send(ctx, opts.Recipient, opts.Caption, opts.MediaPath, opts.ViewOnce)
+	if len(opts.Data) == 0 {
+		return SendResult{Success: false, Message: "no attachment data to send"}
+	}
+	return c.send(ctx, opts.Recipient, opts.Caption, &attachment{name: opts.Filename, data: opts.Data}, opts.ViewOnce)
 }
 
 // send is the unified implementation shared by Send and SendMediaWithOptions.
-func (c *Client) send(ctx context.Context, recipient, message, mediaPath string, viewOnce bool) SendResult {
+func (c *Client) send(ctx context.Context, recipient, message string, att *attachment, viewOnce bool) SendResult {
 	if !c.waClient().IsConnected() {
 		return SendResult{Success: false, Message: "Not connected to WhatsApp"}
 	}
@@ -66,8 +80,10 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 		MessageContextInfo: c.ephemeralContextInfo(ctx, recipientJID),
 	}
 
-	if mediaPath != "" {
-		if err := c.attachMedia(ctx, msg, mediaPath, message, viewOnce); err != nil {
+	mediaName := ""
+	if att != nil {
+		mediaName = att.name
+		if err := c.attachMedia(ctx, msg, *att, message, viewOnce); err != nil {
 			return SendResult{Success: false, Message: err.Error()}
 		}
 	} else {
@@ -80,7 +96,7 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 	}
 
 	// Cache the sent message so local history stays complete.
-	c.persistSent(ctx, recipientJID, resp.ID, message, mediaPath, msg)
+	c.persistSent(ctx, recipientJID, resp.ID, message, mediaName, msg)
 
 	return SendResult{
 		Success: true,
@@ -91,25 +107,71 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 
 // checkSendRate applies the daemon-side rate limit to an outbound message —
 // defense-in-depth against a client (or the LLM driving it) fanning out sends
-// faster than WhatsApp tolerates. The operator override rides on a context
-// value the MCP layer only sets when the request carried the
-// X-Rate-Limit-Override header, which the model cannot forge.
+// faster than WhatsApp tolerates. It also applies the new-recipient policy.
+// Nothing a request carries can bypass either.
 func (c *Client) checkSendRate(ctx context.Context, recipientJID types.JID) error {
+	// Only people and groups are send targets. Broadcast addresses (a message
+	// to status@broadcast goes to everyone who can see the account's status)
+	// and channels are refused outright, whatever the policy and whether or
+	// not a chat row happens to exist for them.
+	switch recipientJID.Server {
+	case types.DefaultUserServer, types.HiddenUserServer, types.GroupServer:
+	default:
+		c.log.Warnf("Blocked: send to %s refused, not a person or a group", c.redactor.JID(recipientJID.String()))
+		return errors.New("messages can only be sent to a person or a group, not to a broadcast address or channel")
+	}
+	if c.blockNewRecipients && c.IsNewRecipient(recipientJID) {
+		c.log.Warnf("Blocked: send to %s refused, the chat has no history", c.redactor.JID(recipientJID.String()))
+		return errors.New("this chat has no previous messages, and sending to new recipients is turned off on this server " +
+			"(the host can allow it with ALLOW_NEW_RECIPIENTS=true)")
+	}
 	if c.limiter == nil {
 		return nil
 	}
 	if ratelimit.BypassFromContext(ctx) {
-		c.log.Warnf("RATE LIMIT OVERRIDE: send to %s bypassed the limiter via X-Rate-Limit-Override", c.redactor.JID(recipientJID.String()))
 		return nil
 	}
 	isContact := c.IsKnownContact(recipientJID)
 	if d := c.limiter.AllowSend(isContact); !d.Allowed {
 		c.log.Warnf("Rate limited: send to %s denied (%s); retry in %s", c.redactor.JID(recipientJID.String()), d.Reason, d.RetryAfter.Round(time.Second))
-		return fmt.Errorf(
-			"rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass; see the daemon rate-limit docs)",
-			d.Reason, d.RetryAfter.Round(time.Second))
+		return fmt.Errorf("rate limited: %s — retry in %s", d.Reason, d.RetryAfter.Round(time.Second))
 	}
 	return nil
+}
+
+// RecipientIsNew is IsNewRecipient for a recipient as a tool receives it (a
+// phone number or JID). Something that cannot be parsed counts as new.
+func (c *Client) RecipientIsNew(recipient string) bool {
+	jid, err := parseRecipient(recipient)
+	if err != nil {
+		return true
+	}
+	return c.IsNewRecipient(jid)
+}
+
+// IsNewRecipient reports whether jid is a chat with no history in the
+// archive. A lookup failure counts as new: the send policy fails closed.
+func (c *Client) IsNewRecipient(jid types.JID) bool {
+	if c.store == nil {
+		return true
+	}
+	// The same person can be stored under a phone-number JID or a hidden-ID
+	// JID, depending on what WhatsApp had told us when the chat was first
+	// seen. Check every form the recipient can take.
+	forms := []string{jid.String(), c.cacheChatJID(jid)}
+	if lid := c.store.ResolveJIDToLID(jid.ToNonAD().String()); lid != "" {
+		forms = append(forms, lid)
+	}
+	for _, form := range forms {
+		known, err := c.store.ChatExists(form)
+		if err != nil {
+			return true
+		}
+		if known {
+			return false
+		}
+	}
+	return true
 }
 
 // sendMessage sends msg to `to` after checkSendRate admits it. Replies,
@@ -178,19 +240,18 @@ func parseRecipient(recipient string) (types.JID, error) {
 // When viewOnce is true, the resulting Image/Video/Audio submessage is flagged
 // as view-once. DocumentMessage has no view-once support in WhatsApp clients,
 // so the flag is silently ignored for documents.
-func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, mediaPath, caption string, viewOnce bool) error {
-	safePath, err := c.ValidateMediaPath(mediaPath)
-	if err != nil {
-		return fmt.Errorf("media_path rejected: %w", err)
+func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, att attachment, caption string, viewOnce bool) error {
+	if len(att.data) == 0 {
+		return errors.New("attachment is empty")
 	}
-	mediaData, err := os.ReadFile(safePath)
-	if err != nil {
-		return fmt.Errorf("read media file: %w", err)
+	mediaData := att.data
+	mediaType, mimeType := mediaTypeFromExt(att.name)
+
+	upload := c.uploadMedia
+	if upload == nil {
+		upload = c.waClient().Upload
 	}
-
-	mediaType, mimeType := mediaTypeFromExt(safePath)
-
-	resp, err := c.waClient().Upload(ctx, mediaData, mediaType)
+	resp, err := upload(ctx, mediaData, mediaType)
 	if err != nil {
 		return fmt.Errorf("Error uploading media: %v", err)
 	}
@@ -255,7 +316,7 @@ func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, mediaPat
 		}
 	case whatsmeow.MediaDocument:
 		// View-once on documents is not supported by WhatsApp clients; silently ignored.
-		msg.DocumentMessage = outgoingDocumentMessage(mediaPath, caption, mimeType, resp)
+		msg.DocumentMessage = outgoingDocumentMessage(att.name, caption, mimeType, resp)
 	}
 	return nil
 }

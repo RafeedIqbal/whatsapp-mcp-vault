@@ -1,9 +1,9 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -18,6 +18,8 @@ import (
 func (s *Server) registerSendTools() {
 	s.registerSendMessage()
 	s.registerSendFile()
+	s.registerCreateUploadLink()
+	s.registerConfirmSend()
 	s.registerSendAudioMessage()
 	s.registerSendReaction()
 	s.registerSendReply()
@@ -47,7 +49,6 @@ func (s *Server) registerSendMessage() {
 		if a.Recipient == "" {
 			return mcp.NewToolResultError("recipient must be provided"), nil
 		}
-		ctx = withRateLimitOverride(ctx, req)
 		r := s.client.Send(ctx, a.Recipient, a.Message)
 		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
 		return resultJSON(r)
@@ -58,17 +59,33 @@ func (s *Server) registerSendMessage() {
 
 type sendFileArgs struct {
 	Recipient    string `json:"recipient"`
-	MediaPath    string `json:"media_path"`
+	URL          string `json:"url,omitempty"`
+	UploadID     string `json:"upload_id,omitempty"`
+	DataBase64   string `json:"data_base64,omitempty"`
+	Filename     string `json:"filename,omitempty"`
 	Caption      string `json:"caption,omitempty"`
 	MarkChatRead bool   `json:"mark_chat_read,omitempty"`
 	ViewOnce     bool   `json:"view_once,omitempty"`
 }
 
+// attachmentArgs are the "where is the file" arguments shared by the tools
+// that send one. Files never come from a path on the server.
+func attachmentArgs() []mcp.ToolOption {
+	return []mcp.ToolOption{
+		mcp.WithString("url", mcp.Description("public https link to the file; the server downloads it (links to private or local addresses are refused)")),
+		mcp.WithString("upload_id", mcp.Description("id from create_upload_link, once the user has uploaded the file on that page; works once")),
+		mcp.WithString("data_base64", mcp.Description("the file itself, base64-encoded, for small files (up to 5 MB); requires filename")),
+		mcp.WithString("filename", mcp.Description("name for the file, with its extension (for example photo.jpg, report.pdf); required with data_base64, optional otherwise")),
+	}
+}
+
 func (s *Server) registerSendFile() {
-	tool := mcp.NewTool("send_file",
-		mcp.WithDescription("Upload and send a picture, video, document, or raw audio attachment via WhatsApp; the recipient sees a media message and the outgoing row is persisted to the local cache. Reversible via delete_message (revoke). For voice notes use send_audio_message (which transcodes to ogg/opus); for plain text use send_message. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+	opts := []mcp.ToolOption{
+		mcp.WithDescription("Send a picture, video, document or raw audio attachment via WhatsApp; the recipient sees a media message and the outgoing row is saved to the local archive. Supply the file by exactly one of url, upload_id or data_base64: when the user wants to send a file from their own device, call create_upload_link first. The file is held in memory only. Reversible via delete_message (revoke for everyone). Returns `{success, message, id}`. Use send_audio_message for voice notes."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
-		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the media file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
+	}
+	opts = append(opts, attachmentArgs()...)
+	opts = append(opts,
 		mcp.WithString("caption", mcp.Description("optional caption for image/video/document submessages; ignored for raw audio")),
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
 		mcp.WithBoolean("view_once", mcp.DefaultBool(false), mcp.Description("if true, mark image/video/audio submessages as view-once; silently ignored for documents (defaults to false)")),
@@ -77,19 +94,20 @@ func (s *Server) registerSendFile() {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
+	tool := mcp.NewTool("send_file", opts...)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a sendFileArgs) (*mcp.CallToolResult, error) {
-		if a.Recipient == "" || a.MediaPath == "" {
-			return mcp.NewToolResultError("recipient and media_path are required"), nil
+		if a.Recipient == "" {
+			return mcp.NewToolResultError("recipient is required"), nil
 		}
-		safePath, err := s.client.ValidateMediaPath(a.MediaPath)
+		file, err := s.resolveAttachment(ctx, attachmentSource{URL: a.URL, UploadID: a.UploadID, DataBase64: a.DataBase64, Filename: a.Filename})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		ctx = withRateLimitOverride(ctx, req)
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
 			Caption:   a.Caption,
-			MediaPath: safePath,
+			Filename:  file.Filename,
+			Data:      file.Data,
 			ViewOnce:  a.ViewOnce,
 		})
 		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
@@ -97,20 +115,52 @@ func (s *Server) registerSendFile() {
 	}))
 }
 
+// -- create_upload_link -----------------------------------------------------
+
+func (s *Server) registerCreateUploadLink() {
+	tool := mcp.NewTool("create_upload_link",
+		mcp.WithDescription("Create a one-time page where the user can upload a file from their own device, so it can be sent with send_file or send_audio_message. Give the user upload_url to open; after they say the upload is done, pass upload_id to the send tool. The link works once, expires after a few minutes, and the file is held in memory only. Nothing is sent to WhatsApp by this tool. Returns `{upload_url, upload_id, expires_in_seconds, max_bytes}`."),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
+	)
+	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if s.files == nil || s.files.Transfers == nil {
+			return mcp.NewToolResultError("this server has no upload page; send small files with data_base64 or give a public https link"), nil
+		}
+		id, link, err := s.files.Transfers.NewUploadSlot()
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return resultJSON(map[string]any{
+			"upload_url":         link,
+			"upload_id":          id,
+			"expires_in_seconds": int(s.files.Transfers.TTL().Seconds()),
+			"max_bytes":          s.files.Transfers.MaxItem(),
+		})
+	})
+}
+
 // -- send_audio_message -----------------------------------------------------
 
 type sendAudioArgs struct {
 	Recipient    string `json:"recipient"`
-	MediaPath    string `json:"media_path"`
+	URL          string `json:"url,omitempty"`
+	UploadID     string `json:"upload_id,omitempty"`
+	DataBase64   string `json:"data_base64,omitempty"`
+	Filename     string `json:"filename,omitempty"`
 	MarkChatRead bool   `json:"mark_chat_read,omitempty"`
 	ViewOnce     bool   `json:"view_once,omitempty"`
 }
 
 func (s *Server) registerSendAudioMessage() {
-	tool := mcp.NewTool("send_audio_message",
-		mcp.WithDescription("Send an audio file as a WhatsApp voice note (waveform UI, push-to-play); non-ogg inputs are transcoded via ffmpeg before upload. Reversible via delete_message (revoke). Use send_file when you want the audio delivered as a regular attachment instead of a voice note. Prerequisites: ffmpeg must be on PATH for non-ogg inputs. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+	opts := []mcp.ToolOption{
+		mcp.WithDescription("Send an audio clip as a WhatsApp voice note (waveform UI, push-to-play). Supply the clip by exactly one of url, upload_id or data_base64. Audio that is not already Ogg Opus is converted in memory with ffmpeg; formats that cannot be read as a stream (some .m4a files) fail with an error, in which case use send_file to send the audio as a plain attachment. Reversible via delete_message (revoke for everyone). Returns `{success, message, id}`."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
-		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the audio file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
+	}
+	opts = append(opts, attachmentArgs()...)
+	opts = append(opts,
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
 		mcp.WithBoolean("view_once", mcp.DefaultBool(false), mcp.Description("if true, mark the voice note as view-once (defaults to false)")),
 		mcp.WithReadOnlyHintAnnotation(false),
@@ -118,27 +168,33 @@ func (s *Server) registerSendAudioMessage() {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
+	tool := mcp.NewTool("send_audio_message", opts...)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a sendAudioArgs) (*mcp.CallToolResult, error) {
-		if a.Recipient == "" || a.MediaPath == "" {
-			return mcp.NewToolResultError("recipient and media_path are required"), nil
+		if a.Recipient == "" {
+			return mcp.NewToolResultError("recipient is required"), nil
 		}
-		ctx = withRateLimitOverride(ctx, req)
-		safePath, err := s.client.ValidateMediaPath(a.MediaPath)
+		// A voice note is named by us; the caller's filename only matters
+		// for detecting input that is already Ogg.
+		src := attachmentSource{URL: a.URL, UploadID: a.UploadID, DataBase64: a.DataBase64, Filename: a.Filename}
+		if src.DataBase64 != "" && strings.TrimSpace(src.Filename) == "" {
+			src.Filename = "voice"
+		}
+		file, err := s.resolveAttachment(ctx, src)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		path := safePath
-		if !strings.HasSuffix(strings.ToLower(path), ".ogg") {
-			converted, err := media.ConvertToOpusOgg(ctx, path)
+		audio := file.Data
+		if !bytes.HasPrefix(audio, []byte("OggS")) {
+			converted, err := media.ConvertToOpusOggBytes(ctx, audio)
 			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("audio conversion failed: %v (install ffmpeg, or call send_file for raw audio)", err)), nil
+				return mcp.NewToolResultError(fmt.Sprintf("audio conversion failed: %v (use send_file to send the audio as a plain attachment)", err)), nil
 			}
-			defer os.Remove(converted)
-			path = converted
+			audio = converted
 		}
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
-			MediaPath: path,
+			Filename:  "voice.ogg",
+			Data:      audio,
 			ViewOnce:  a.ViewOnce,
 		})
 		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
@@ -168,7 +224,6 @@ func (s *Server) registerSendReaction() {
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a sendReactionArgs) (*mcp.CallToolResult, error) {
-		ctx = withRateLimitOverride(ctx, req)
 		if err := s.client.SendReaction(ctx, a.ChatJID, a.MessageID, a.SenderJID, a.Emoji); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -198,7 +253,6 @@ func (s *Server) registerSendReply() {
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a sendReplyArgs) (*mcp.CallToolResult, error) {
-		ctx = withRateLimitOverride(ctx, req)
 		if err := s.client.SendReply(ctx, a.ChatJID, a.TargetMessageID, a.TargetSenderJID, a.Body); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

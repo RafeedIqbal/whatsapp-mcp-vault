@@ -11,6 +11,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -22,6 +23,10 @@ type Runtime interface {
 	// Close releases it all: disconnects, closes the databases.
 	Close() error
 }
+
+// unlockTimeout bounds how long building the runtime may take. Without it a
+// stalled network call during unlock would hold every request forever.
+const unlockTimeout = 2 * time.Minute
 
 // ErrKeyMismatch is returned when a request presents a key other than the one
 // the running runtime was built with.
@@ -98,7 +103,7 @@ func (m *Manager[R]) Acquire(ctx context.Context, key vault.Key) (rt R, release 
 			m.mu.Unlock()
 			// One caller going away must not abort the unlock the others
 			// are waiting on.
-			built, berr := m.build(context.WithoutCancel(ctx), key)
+			built, berr := m.runBuild(ctx, key)
 			m.mu.Lock()
 			if berr != nil {
 				m.state = locked
@@ -125,6 +130,22 @@ func (m *Manager[R]) Acquire(ctx context.Context, key vault.Key) (rt R, release 
 			m.cond.Wait()
 		}
 	}
+}
+
+// runBuild builds the runtime with a deadline, detached from the caller's
+// cancellation (one caller going away must not abort the unlock the others
+// are waiting on), and turns a panic into an error so the manager can return
+// to the locked state instead of staying stuck mid-unlock.
+func (m *Manager[R]) runBuild(ctx context.Context, key vault.Key) (rt R, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			var zero R
+			rt, err = zero, fmt.Errorf("session: unlocking failed unexpectedly: %v", r)
+		}
+	}()
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+	defer cancel()
+	return m.build(bctx, key)
 }
 
 func (m *Manager[R]) releaser() func() {
@@ -178,7 +199,11 @@ func (m *Manager[R]) closeLocked() {
 	m.key = vault.Key{} // forget the key
 	m.mu.Unlock()
 
-	_ = rt.Close()
+	func() {
+		// Whatever Close does, the manager must end up locked.
+		defer func() { _ = recover() }()
+		_ = rt.Close()
+	}()
 
 	m.mu.Lock()
 	m.state = locked

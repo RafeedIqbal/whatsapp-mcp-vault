@@ -10,9 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"strings"
 )
 
 // AnalyzeOggOpus returns the unclamped duration rounded up to seconds and a
@@ -199,83 +197,6 @@ func PlaceholderWaveform(duration uint32) []byte {
 	return waveform
 }
 
-// ConvertToOpusOgg shells out to ffmpeg to convert any audio file to opus/ogg,
-// writing the output to a temp file. Returns the temp file path. The caller
-// is responsible for removing the file.
-func ConvertToOpusOgg(ctx context.Context, inputPath string) (outputPath string, err error) {
-	if _, lookErr := exec.LookPath("ffmpeg"); lookErr != nil {
-		return "", errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
-	}
-
-	tmp, err := os.CreateTemp("", "mcp-whatsapp-audio-*.ogg")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Flag-injection guard: ffmpeg treats any arg starting with `-` as a
-	// flag, so a file whose basename happens to start with `-` (e.g. from
-	// a malicious or malformed path that made it past media_path
-	// allowlisting) could inject options. Rewrite to `./<basename>` so the
-	// leading `.` forces ffmpeg to read it as a path.
-	safeInput := sanitizeFFmpegInputPath(inputPath)
-
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-i", safeInput,
-		"-c:a", "libopus",
-		"-b:a", "32k",
-		"-vbr", "on",
-		"-compression_level", "10",
-		"-y",
-		tmpPath,
-	)
-	cmd.Env = minimalEnv()
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(stderr.String()))
-	}
-
-	return tmpPath, nil
-}
-
-// sanitizeFFmpegInputPath rewrites paths whose basename begins with `-` so
-// that ffmpeg treats them as files rather than option flags. Absolute paths
-// pass through unchanged (they already begin with `/`); relative paths get a
-// `./` prefix when the basename would otherwise begin with `-`.
-//
-// Examples:
-//
-//	"/tmp/foo.mp3"      -> "/tmp/foo.mp3"
-//	"/tmp/-weird.mp3"   -> "/tmp/-weird.mp3"  (basename-leading-dash, absolute is safe)
-//	"-weird.mp3"        -> "./-weird.mp3"
-//	"./-weird.mp3"      -> "./-weird.mp3"
-func sanitizeFFmpegInputPath(p string) string {
-	if p == "" {
-		return p
-	}
-	// Absolute paths already start with `/` (or a drive letter on Windows,
-	// but we don't run on Windows), which ffmpeg parses as a filename.
-	if filepath.IsAbs(p) {
-		return p
-	}
-	// Relative paths that already lead with `./` or `../` are fine.
-	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") {
-		return p
-	}
-	if strings.HasPrefix(p, "-") {
-		return "./" + p
-	}
-	return p
-}
-
 var safeEnvKeys = []string{"PATH", "TMPDIR", "TEMP", "TMP", "HOME"}
 
 // minimalEnv returns a restricted environment for child processes, carrying
@@ -303,4 +224,59 @@ func sanitizeStderr(s string) string {
 		s = s[:200]
 	}
 	return s
+}
+
+// maxConvertedAudioBytes bounds what a conversion may produce.
+const maxConvertedAudioBytes = 32 << 20
+
+// ConvertToOpusOggBytes converts audio held in memory to Ogg Opus, the format
+// WhatsApp voice notes use. ffmpeg reads the clip from its standard input and
+// writes the result to its standard output, so nothing is written to disk.
+//
+// Formats that can only be read with seeking (some .m4a/.mp4 files, whose
+// index sits at the end) cannot be converted this way and return an error.
+func ConvertToOpusOggBytes(ctx context.Context, input []byte) ([]byte, error) {
+	if len(input) == 0 {
+		return nil, errors.New("no audio to convert")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-i", "pipe:0",
+		"-vn",
+		"-c:a", "libopus",
+		"-b:a", "32k",
+		"-vbr", "on",
+		"-compression_level", "10",
+		"-f", "ogg",
+		"pipe:1",
+	)
+	cmd.Env = minimalEnv()
+	cmd.Stdin = bytes.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &limitedWriter{w: &stdout, left: maxConvertedAudioBytes}
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(stderr.String()))
+	}
+	if stdout.Len() == 0 {
+		return nil, errors.New("ffmpeg produced no audio")
+	}
+	return stdout.Bytes(), nil
+}
+
+// limitedWriter fails once more than its budget has been written.
+type limitedWriter struct {
+	w    *bytes.Buffer
+	left int
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if len(p) > l.left {
+		return 0, errors.New("converted audio is too large")
+	}
+	l.left -= len(p)
+	return l.w.Write(p)
 }

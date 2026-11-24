@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,6 +53,13 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	allowRemoteSet := false
+	fs.Visit(func(fl *flag.Flag) { allowRemoteSet = allowRemoteSet || fl.Name == "allow-remote" })
+	allowRemote, allowRemoteErr := resolveAllowRemote(allowRemoteSet, allowRemote, os.Getenv)
+	if allowRemoteErr != nil {
+		fmt.Fprintf(os.Stderr, "serve: %v\n", allowRemoteErr)
+		return 2
+	}
 	fullHistory, fullHistoryErr := resolveFullHistory(fs, *fullHistoryFlag, os.Getenv)
 	if fullHistoryErr != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", fullHistoryErr)
@@ -85,32 +91,21 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	}
 	defer lock.Release()
 
-	absStore, err := filepath.Abs(storeDir)
+	policy, err := sendPolicyFromEnv(os.Getenv)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve store dir: %v\n", err)
-		return 1
+		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
+		return 2
 	}
-	allowedMediaRoot := os.Getenv("WHATSAPP_MCP_MEDIA_ROOT")
-	if allowedMediaRoot == "" {
-		allowedMediaRoot = filepath.Join(absStore, "uploads")
-	}
-	allowedMediaRoot = filepath.Clean(allowedMediaRoot)
-	if mkErr := os.MkdirAll(allowedMediaRoot, 0o755); mkErr != nil {
-		fmt.Fprintf(os.Stderr, "warn: could not create media root %q: %v\n", allowedMediaRoot, mkErr)
-	}
-	// Operator UX: make the media root obvious on boot so users know where
-	// to drop outbound attachments.
-	fmt.Fprintf(os.Stderr, "media root: %s (drop outbound files here)\n", allowedMediaRoot)
 
 	if !envKeyMode {
 		return runVaultServe(ctx, vaultServeOptions{
-			storeDir:         storeDir,
-			addr:             addr,
-			redactor:         redactor,
-			allowedMediaRoot: allowedMediaRoot,
-			readOnly:         readOnly,
-			labelsEnabled:    labelsEnabled,
-			fullHistory:      fullHistory,
+			storeDir:      storeDir,
+			addr:          addr,
+			redactor:      redactor,
+			readOnly:      readOnly,
+			labelsEnabled: labelsEnabled,
+			fullHistory:   fullHistory,
+			policy:        policy,
 		})
 	}
 
@@ -127,14 +122,14 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	defer st.Close()
 
 	c, err := client.New(ctx, client.Config{
-		StoreDir:         storeDir,
-		Key:              vaultKey,
-		Store:            st,
-		Logger:           client.NewStderrLogger("Client", "INFO", false),
-		AllowedMediaRoot: allowedMediaRoot,
-		Redactor:         redactor,
-		LabelsEnabled:    labelsEnabled,
-		FullHistory:      fullHistory,
+		StoreDir:           storeDir,
+		Key:                vaultKey,
+		Store:              st,
+		Logger:             client.NewStderrLogger("Client", "INFO", false),
+		Redactor:           redactor,
+		LabelsEnabled:      labelsEnabled,
+		FullHistory:        fullHistory,
+		BlockNewRecipients: policy.blockNewRecipients,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init client: %v\n", err)
@@ -168,7 +163,13 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 	if labelsEnabled {
 		fmt.Fprintln(os.Stderr, "WhatsApp Business label sync and tools are enabled")
 	}
-	d.SetMCPMount(mcpServer.AttachHTTP)
+	files := newFiles("http://" + addr)
+	mcpServer.SetFiles(files)
+	mcpServer.SetSendConfirmation(policy.effectiveConfirm())
+	d.SetMCPMount(func(mux *http.ServeMux) {
+		mcpServer.AttachHTTP(mux)
+		files.Transfers.Mount(mux)
+	})
 
 	fmt.Fprintf(os.Stderr, "whatsapp-mcp listening on http://%s (MCP at /mcp, pairing at /pair)\n", addr)
 	if !c.IsLoggedIn() {

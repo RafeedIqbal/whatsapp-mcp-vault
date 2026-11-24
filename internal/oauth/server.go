@@ -72,6 +72,7 @@ type Server struct {
 
 	mu             sync.Mutex
 	pending        map[string]pendingConsent
+	pendingSeq     uint64
 	regWindowStart time.Time
 	regCount       int
 }
@@ -84,6 +85,7 @@ type pendingConsent struct {
 	challenge   string
 	requested   []string
 	expires     time.Time
+	seq         uint64 // order of arrival, for dropping the oldest
 }
 
 // NewServer returns a sign-in server for cfg.
@@ -429,9 +431,20 @@ func (s *Server) putPending(p pendingConsent) (string, error) {
 			delete(s.pending, k)
 		}
 	}
-	if len(s.pending) >= maxPendingConsents {
-		return "", errors.New("oauth: too many sign-in pages open")
+	// Opening a consent page needs no credentials, so the store is capped by
+	// dropping the oldest page, never by refusing the newest: a flood of
+	// abandoned pages must not be able to block a real sign-in.
+	for len(s.pending) >= maxPendingConsents {
+		var oldest string
+		for k, v := range s.pending {
+			if oldest == "" || v.seq < s.pending[oldest].seq {
+				oldest = k
+			}
+		}
+		delete(s.pending, oldest)
 	}
+	s.pendingSeq++
+	p.seq = s.pendingSeq
 	p.expires = now.Add(consentTTL)
 	s.pending[id] = p
 	return id, nil

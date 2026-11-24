@@ -16,7 +16,9 @@ import (
 // drifts.
 var expectedToolNames = []string{
 	"block_contact",
+	"confirm_send",
 	"create_group",
+	"create_upload_link",
 	"delete_message",
 	"download_media",
 	"edit_message",
@@ -127,7 +129,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 
 func TestNewServer_ToolCount(t *testing.T) {
 	s := NewServer(nil, nil, true)
-	const want = 47
+	const want = 49
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
 	}
@@ -140,8 +142,8 @@ func TestNewServer_LabelsDisabledDoesNotAdvertiseLabelTools(t *testing.T) {
 			t.Errorf("label tool %q is advertised while labels are disabled", name)
 		}
 	}
-	if got := len(s.MCP().ListTools()); got != 43 {
-		t.Fatalf("default tool count = %d, want 43", got)
+	if got := len(s.MCP().ListTools()); got != 45 {
+		t.Fatalf("default tool count = %d, want 45", got)
 	}
 }
 

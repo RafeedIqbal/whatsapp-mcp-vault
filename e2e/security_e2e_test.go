@@ -11,7 +11,9 @@ import (
 	"testing"
 )
 
-func TestSendFileRejectsOutOfRootPath(t *testing.T) {
+// send_file takes its attachment from a link, an upload or inline data. A
+// path on the server (which older versions accepted) must not be read.
+func TestSendFileNeverReadsAServerPath(t *testing.T) {
 	h := newHarness(t)
 	h.initializeMCP()
 
@@ -20,10 +22,13 @@ func TestSendFileRejectsOutOfRootPath(t *testing.T) {
 		"media_path": "/etc/passwd",
 	})
 	if !res.IsError {
-		t.Fatalf("expected error result, got success: %+v", res)
+		t.Fatalf("expected an error result, got success: %+v", res)
 	}
-	if !strings.Contains(res.Text, "allowed root") {
-		t.Fatalf("error should mention allowed root, got %q", res.Text)
+	if !strings.Contains(res.Text, "needs one source") {
+		t.Fatalf("error should say an attachment source is missing, got %q", res.Text)
+	}
+	if strings.Contains(res.Text, "root:") {
+		t.Fatalf("the result contains file contents: %q", res.Text)
 	}
 }
 

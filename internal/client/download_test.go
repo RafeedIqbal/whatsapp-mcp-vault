@@ -179,3 +179,50 @@ func TestValidateMediaPayloadRejectsWrongHashAndLength(t *testing.T) {
 		t.Fatal("wrong hash accepted")
 	}
 }
+
+// Each download holds a whole file in memory. Without a cap, a burst of
+// requests for large files could exhaust a small instance.
+func TestOnlyAFewMediaDownloadsRunAtOnce(t *testing.T) {
+	payload := []byte("PAYLOAD")
+	f := newMediaFixture(t, payload, payload, "image", "photo.jpg", uint64(len(payload)))
+	release := make(chan struct{})
+	started := make(chan struct{}, maxConcurrentDownloads+4)
+	f.c.downloadMedia = func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error) {
+		started <- struct{}{}
+		<-release
+		return payload, nil
+	}
+	done := make(chan DownloadResult, maxConcurrentDownloads)
+	for i := 0; i < maxConcurrentDownloads; i++ {
+		go func() { done <- f.c.Download(context.Background(), mediaMsgID, mediaChat) }()
+	}
+	for i := 0; i < maxConcurrentDownloads; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("downloads did not start")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	extra := f.c.Download(ctx, mediaMsgID, mediaChat)
+	if extra.Success || !strings.Contains(extra.Message, "downloads") {
+		t.Fatalf("a download beyond the limit was not refused: %+v", extra)
+	}
+	select {
+	case <-started:
+		t.Fatal("a download beyond the limit started fetching")
+	default:
+	}
+
+	close(release)
+	for i := 0; i < maxConcurrentDownloads; i++ {
+		if r := <-done; !r.Success {
+			t.Fatalf("a download within the limit failed: %s", r.Message)
+		}
+	}
+	if r := f.c.Download(context.Background(), mediaMsgID, mediaChat); !r.Success {
+		t.Fatalf("download after the others finished: %s", r.Message)
+	}
+}

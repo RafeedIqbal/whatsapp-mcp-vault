@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -74,5 +76,75 @@ func TestKeyInEnvironmentModeIsLocalOnly(t *testing.T) {
 		if err := checkServeMode(ok[0], ok[1]); err != nil {
 			t.Errorf("checkServeMode(%v, %v) = %v, want allowed", ok[0], ok[1], err)
 		}
+	}
+}
+
+// Hosts that configure containers through environment variables (Render,
+// Fly) need a way to allow remote connections without overriding the command.
+func TestAllowRemoteFromEnv(t *testing.T) {
+	for name, tc := range map[string]struct {
+		flagSet, flagValue bool
+		env                string
+		want, ok           bool
+	}{
+		"default off":          {false, false, "", false, true},
+		"env on":               {false, false, "1", true, true},
+		"env true":             {false, false, "true", true, true},
+		"env off":              {false, false, "0", false, true},
+		"flag wins over env":   {true, false, "1", false, true},
+		"flag on, env unset":   {true, true, "", true, true},
+		"env is not a boolean": {false, false, "yes please", false, false},
+	} {
+		got, err := resolveAllowRemote(tc.flagSet, tc.flagValue, envOf(map[string]string{"WHATSAPP_MCP_ALLOW_REMOTE": tc.env}))
+		if (err == nil) != tc.ok || (tc.ok && got != tc.want) {
+			t.Errorf("%s: got %v err=%v, want %v ok=%v", name, got, err, tc.want, tc.ok)
+		}
+	}
+}
+
+// If WhatsApp cannot be reached when the instance unlocks, the archive must
+// still be readable; connecting is retried in the background until it works
+// or the instance locks again.
+func TestConnectIsRetriedUntilItWorks(t *testing.T) {
+	attempts := 0
+	waits := 0
+	connectWithRetry(context.Background(), func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("network unreachable")
+		}
+		return nil
+	}, func(time.Duration) <-chan time.Time {
+		waits++
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	})
+	if attempts != 3 || waits != 2 {
+		t.Fatalf("attempts=%d waits=%d, want 3 and 2", attempts, waits)
+	}
+}
+
+func TestConnectRetryStopsWhenTheInstanceLocks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	done := make(chan struct{})
+	go func() {
+		connectWithRetry(ctx, func(context.Context) error {
+			attempts++
+			return errors.New("still unreachable")
+		}, func(time.Duration) <-chan time.Time {
+			cancel() // the instance locks while waiting to retry
+			return make(chan time.Time)
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retrying did not stop when the instance locked")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }

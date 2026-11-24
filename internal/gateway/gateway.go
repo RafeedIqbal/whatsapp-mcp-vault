@@ -9,6 +9,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -58,6 +59,12 @@ type Config[R Runtime] struct {
 	SetupToken string
 	// SecureCookies marks the owner cookie Secure (set when served over https).
 	SecureCookies bool
+	// RevokeAll ends every app's sign-in (oauth.Store.RevokeAll).
+	RevokeAll func(ctx context.Context) error
+	// Extra mounts further always-available routes (the one-time upload page
+	// and download links). They are served without a sign-in and without
+	// unlocking the instance. Optional.
+	Extra func(mux *http.ServeMux)
 	// Now is the clock; time.Now when nil.
 	Now func() time.Time
 	// Logf records operational failures. It is never given keys, tokens,
@@ -108,6 +115,9 @@ func (g *Gateway[R]) Handler() http.Handler {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 	})
 	g.cfg.OAuth.Mount(mux)
+	if g.cfg.Extra != nil {
+		g.cfg.Extra(mux)
+	}
 	mux.HandleFunc("/mcp", g.handleTools)
 	mux.HandleFunc("GET /setup", g.handleSetupPage)
 	mux.HandleFunc("POST /setup", g.handleSetupSubmit)
@@ -209,6 +219,66 @@ func (g *Gateway[R]) expireOwnersLocked(now time.Time) {
 	}
 }
 
+// ExpireOwners drops owner sign-ins that have gone idle, and with them the
+// copies of the key they hold. It must be called periodically: an owner who
+// closes the tab sends no further request that would trigger the check.
+func (g *Gateway[R]) ExpireOwners() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.expireOwnersLocked(g.cfg.Now())
+}
+
+// Run calls ExpireOwners every interval until ctx ends, then forgets every
+// owner sign-in.
+func (g *Gateway[R]) Run(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			g.forgetOwners()
+			return
+		case <-t.C:
+			g.ExpireOwners()
+		}
+	}
+}
+
+func (g *Gateway[R]) ownerCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.owners)
+}
+
+// forgetOwners ends every owner sign-in and wipes the keys they held.
+func (g *Gateway[R]) forgetOwners() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, s := range g.owners {
+		s.key = vault.Key{}
+		delete(g.owners, id)
+	}
+}
+
+// forgetOwner ends the owner sign-in the request carries, if any.
+func (g *Gateway[R]) forgetOwner(r *http.Request) {
+	c, err := r.Cookie(ownerCookieName)
+	if err != nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if s, ok := g.owners[c.Value]; ok {
+		s.key = vault.Key{}
+		delete(g.owners, c.Value)
+	}
+}
+
+func (g *Gateway[R]) clearOwnerCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: ownerCookieName, Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: g.cfg.SecureCookies, SameSite: http.SameSiteStrictMode})
+}
+
 // signOwnerIn starts an owner session holding key and sets its cookie.
 func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 	raw := make([]byte, 32)
@@ -240,8 +310,9 @@ func (g *Gateway[R]) signOwnerIn(w http.ResponseWriter, key vault.Key) error {
 // --- setup -----------------------------------------------------------------
 
 type setupView struct {
-	Mode     string // "init", "login", "owner", "recovery", "disabled"
+	Mode     string // "init", "login", "recover", "owner", "recovery", "disabled"
 	Error    string
+	Notice   string
 	Recovery string
 }
 
@@ -259,6 +330,10 @@ func (g *Gateway[R]) handleSetupPage(w http.ResponseWriter, r *http.Request) {
 	default:
 		if _, ok := g.ownerKey(r); ok {
 			g.renderSetup(w, http.StatusOK, setupView{Mode: "owner"})
+			return
+		}
+		if r.URL.Query().Has("recover") {
+			g.renderSetup(w, http.StatusOK, setupView{Mode: "recover"})
 			return
 		}
 		g.renderSetup(w, http.StatusOK, setupView{Mode: "login"})
@@ -280,6 +355,18 @@ func (g *Gateway[R]) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		g.handleInit(w, r)
 	case "login":
 		g.handleLogin(w, r)
+	case "recover":
+		g.handleRecover(w, r)
+	case "change":
+		g.handleChangePassphrase(w, r)
+	case "revoke":
+		g.handleRevokeAll(w, r)
+	case "lock":
+		g.handleLockNow(w, r)
+	case "logout":
+		g.forgetOwner(r)
+		g.clearOwnerCookie(w)
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 	default:
 		http.Error(w, "unknown action", http.StatusBadRequest)
 	}
@@ -332,7 +419,10 @@ func (g *Gateway[R]) handleInit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
-	key, err := g.cfg.Meta.UnlockWithPassphrase(r.Context(), r.PostForm.Get("passphrase"))
+	// Either secret the owner holds signs them in. The recovery code is not
+	// subject to the wrong-guess pause, so it works even while someone else's
+	// guesses have paused passphrase sign-in.
+	key, err := g.cfg.Meta.Unlock(r.Context(), r.PostForm.Get("passphrase"))
 	var locked *vault.LockedOutError
 	switch {
 	case err == nil:
@@ -340,7 +430,7 @@ func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
 		g.renderSetup(w, http.StatusOK, setupView{Mode: "login", Error: "Wrong passphrase. Please try again."})
 		return
 	case errors.As(err, &locked):
-		g.renderSetup(w, http.StatusOK, setupView{Mode: "login", Error: "Too many wrong attempts. Sign-in is paused until " + locked.Until.UTC().Format("15:04 UTC") + "."})
+		g.renderSetup(w, http.StatusOK, setupView{Mode: "login", Error: "Too many wrong attempts. Passphrase sign-in is paused until " + locked.Until.UTC().Format("15:04 UTC") + ". Your recovery code still works."})
 		return
 	case errors.Is(err, vault.ErrNotInitialized):
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
@@ -355,6 +445,104 @@ func (g *Gateway[R]) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/pair", http.StatusSeeOther)
+}
+
+// handleRecover lets the owner back in with the recovery code and sets a new
+// passphrase in the same step.
+func (g *Gateway[R]) handleRecover(w http.ResponseWriter, r *http.Request) {
+	pass := r.PostForm.Get("passphrase")
+	if pass != r.PostForm.Get("confirm") {
+		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "recover", Error: "The two passphrases do not match."})
+		return
+	}
+	key, err := g.cfg.Meta.UnlockWithRecoveryCode(r.Context(), r.PostForm.Get("recovery_code"))
+	switch {
+	case err == nil:
+	case errors.Is(err, vault.ErrWrongSecret):
+		g.renderSetup(w, http.StatusOK, setupView{Mode: "recover", Error: "That recovery code is not right."})
+		return
+	case errors.Is(err, vault.ErrNotInitialized):
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	default:
+		g.cfg.Logf("gateway: recovery failed: %v", err)
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "Recovery failed because of a server error."})
+		return
+	}
+	switch err := g.cfg.Meta.ChangePassphrase(r.Context(), key, pass); {
+	case errors.Is(err, vault.ErrWeakPassphrase):
+		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "recover", Error: "Choose a passphrase of at least 12 characters."})
+		return
+	case err != nil:
+		g.cfg.Logf("gateway: setting a new passphrase failed: %v", err)
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "recover", Error: "The new passphrase could not be saved."})
+		return
+	}
+	if err := g.signOwnerIn(w, key); err != nil {
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "login", Notice: "Your passphrase was changed. Sign in with it."})
+		return
+	}
+	http.Redirect(w, r, "/setup", http.StatusSeeOther)
+}
+
+// requireOwner returns the signed-in owner's key, or sends the browser to
+// the sign-in page.
+func (g *Gateway[R]) requireOwner(w http.ResponseWriter, r *http.Request) (vault.Key, bool) {
+	key, ok := g.ownerKey(r)
+	if !ok {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+	}
+	return key, ok
+}
+
+func (g *Gateway[R]) handleChangePassphrase(w http.ResponseWriter, r *http.Request) {
+	key, ok := g.requireOwner(w, r)
+	if !ok {
+		return
+	}
+	pass := r.PostForm.Get("passphrase")
+	if pass != r.PostForm.Get("confirm") {
+		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "owner", Error: "The two passphrases do not match."})
+		return
+	}
+	switch err := g.cfg.Meta.ChangePassphrase(r.Context(), key, pass); {
+	case errors.Is(err, vault.ErrWeakPassphrase):
+		g.renderSetup(w, http.StatusBadRequest, setupView{Mode: "owner", Error: "Choose a passphrase of at least 12 characters."})
+	case err != nil:
+		g.cfg.Logf("gateway: changing the passphrase failed: %v", err)
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The new passphrase could not be saved."})
+	default:
+		g.renderSetup(w, http.StatusOK, setupView{Mode: "owner", Notice: "Passphrase changed. Apps that are already connected stay connected."})
+	}
+}
+
+// handleRevokeAll signs every connected app out. Each has to be approved
+// again with the passphrase.
+func (g *Gateway[R]) handleRevokeAll(w http.ResponseWriter, r *http.Request) {
+	if _, ok := g.requireOwner(w, r); !ok {
+		return
+	}
+	if g.cfg.RevokeAll == nil {
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "Signing apps out is not available on this server."})
+		return
+	}
+	if err := g.cfg.RevokeAll(r.Context()); err != nil {
+		g.cfg.Logf("gateway: revoking sign-ins failed: %v", err)
+		g.renderSetup(w, http.StatusInternalServerError, setupView{Mode: "owner", Error: "The apps could not be signed out."})
+		return
+	}
+	g.renderSetup(w, http.StatusOK, setupView{Mode: "owner", Notice: "Every app has been signed out. Connect them again to approve them with your passphrase."})
+}
+
+// handleLockNow locks the instance immediately and ends every owner sign-in.
+func (g *Gateway[R]) handleLockNow(w http.ResponseWriter, r *http.Request) {
+	if _, ok := g.requireOwner(w, r); !ok {
+		return
+	}
+	g.forgetOwners()
+	g.cfg.Sessions.Lock()
+	g.clearOwnerCookie(w)
+	http.Redirect(w, r, "/setup", http.StatusSeeOther)
 }
 
 func (g *Gateway[R]) setupAttemptAllowed() bool {
@@ -383,10 +571,14 @@ var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html>
 <title>WhatsApp connector setup</title>` + strings.Replace(oauth.PageStyle, "</style>", `label{display:block;margin-top:.6rem}
 input[type=text]{width:100%;box-sizing:border-box;padding:.6rem;font-size:1rem;border:1px solid #aaa;border-radius:6px;margin:.3rem 0 1rem}
 .code{font:1.15rem/1.6 ui-monospace,monospace;letter-spacing:.05em;background:#f1f1f1;border-radius:6px;padding:.6rem;word-break:break-all}
+.notice{background:#e8f5ee;border:1px solid #b7dcc6;border-radius:6px;padding:.6rem;margin:0 0 1rem}
+hr{border:0;border-top:1px solid #ddd;margin:1.25rem 0}
+form+form{margin-top:1rem}
 a.button{display:inline-block;text-decoration:none;font-size:1rem;padding:.6rem 1.1rem;border-radius:6px;background:#0b6e4f;color:#fff}
-@media (prefers-color-scheme:dark){input[type=text]{background:#2a2a2a;color:#eee;border-color:#555}.code{background:#2a2a2a}}
+@media (prefers-color-scheme:dark){input[type=text]{background:#2a2a2a;color:#eee;border-color:#555}.code{background:#2a2a2a}.notice{background:#1d3a2b;border-color:#2f5d45}hr{border-top-color:#3a3a3a}}
 </style>`, 1) + `</head><body><div class="card">
 {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+{{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
 {{if eq .Mode "init"}}
 <h1>Set up your WhatsApp connector</h1>
 <p class="who">Choose the passphrase that protects your chats. It is never stored: without it (or the recovery code you get next) nobody, including whoever hosts this server, can read your archive.</p>
@@ -414,10 +606,42 @@ a.button{display:inline-block;text-decoration:none;font-size:1rem;padding:.6rem 
 <input type="password" id="passphrase" name="passphrase" required autofocus autocomplete="current-password">
 <button class="primary" type="submit">Sign in</button>
 </form>
+<p class="note">You can also enter your recovery code here. <a href="/setup?recover">Forgot your passphrase?</a></p>
+{{else if eq .Mode "recover"}}
+<h1>Set a new passphrase</h1>
+<p class="who">Enter the recovery code you saved at setup and choose a new passphrase. Your archive and connected apps are kept.</p>
+<form method="post" action="/setup" autocomplete="off">
+<input type="hidden" name="action" value="recover">
+<label for="recovery_code">Recovery code</label>
+<input type="text" id="recovery_code" name="recovery_code" required autofocus autocapitalize="characters" spellcheck="false">
+<label for="passphrase">New passphrase (at least 12 characters)</label>
+<input type="password" id="passphrase" name="passphrase" required minlength="12" autocomplete="new-password">
+<label for="confirm">New passphrase again</label>
+<input type="password" id="confirm" name="confirm" required minlength="12" autocomplete="new-password">
+<button class="primary" type="submit">Save</button>
+</form>
 {{else if eq .Mode "owner"}}
 <h1>You are signed in</h1>
 <p class="who">This connector is set up. To use it from Claude, add this server's address as a custom connector there.</p>
 <p><a class="button" href="/pair">Link or re-link WhatsApp</a></p>
+<hr>
+<form method="post" action="/setup" autocomplete="off">
+<input type="hidden" name="action" value="change">
+<label for="passphrase">Change passphrase (at least 12 characters)</label>
+<input type="password" id="passphrase" name="passphrase" required minlength="12" autocomplete="new-password">
+<label for="confirm">New passphrase again</label>
+<input type="password" id="confirm" name="confirm" required minlength="12" autocomplete="new-password">
+<button type="submit">Change passphrase</button>
+</form>
+<hr>
+<form method="post" action="/setup"><input type="hidden" name="action" value="revoke">
+<p class="note">Sign every connected app out, for example if a device was lost. Each app has to be approved again.</p>
+<button type="submit">Sign all apps out</button></form>
+<form method="post" action="/setup"><input type="hidden" name="action" value="lock">
+<p class="note">Lock now: disconnect from WhatsApp and discard the key from memory until the next sign-in.</p>
+<button type="submit">Lock now</button></form>
+<form method="post" action="/setup"><input type="hidden" name="action" value="logout">
+<button type="submit">Sign out of this page</button></form>
 {{else}}
 <h1>Setup is not available</h1>
 <p class="who">This server has not been set up, and no setup code is configured. Whoever hosts it needs to set SETUP_TOKEN and restart it.</p>

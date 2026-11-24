@@ -606,3 +606,17 @@ func decodeCursor(cursor string) (time.Time, string, string, error) {
 	}
 	return ts, parts[1], parts[2], nil
 }
+
+// ChatExists reports whether a chat with this JID is in the archive, that is,
+// whether any message has ever been exchanged in it (or history sync listed it).
+func (s *Store) ChatExists(jid string) (bool, error) {
+	if jid == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM chats WHERE jid = ? LIMIT 1`, jid).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}

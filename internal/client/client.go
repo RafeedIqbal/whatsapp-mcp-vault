@@ -31,13 +31,14 @@ import (
 
 // Config configures a new Client.
 type Config struct {
-	StoreDir         string             // directory holding messages.db and whatsapp.db
-	Key              vault.Key          // instance data key; whatsapp.db is encrypted under it
-	Store            *store.Store       // initialized message store
-	Logger           waLog.Logger       // optional; defaults to stderr at INFO
-	AllowedMediaRoot string             // absolute path; media_path args must live under this
-	Redactor         *security.Redactor // optional; defaults to a redacting instance
-	LabelsEnabled    bool               // opt in to full app-state events for label sync; default false
+	StoreDir string       // directory holding messages.db and whatsapp.db
+	Key      vault.Key    // instance data key; whatsapp.db is encrypted under it
+	Store    *store.Store // initialized message store
+	Logger   waLog.Logger // optional; defaults to stderr at INFO
+	// BlockNewRecipients refuses sends to chats with no history in the archive.
+	BlockNewRecipients bool
+	Redactor           *security.Redactor // optional; defaults to a redacting instance
+	LabelsEnabled      bool               // opt in to full app-state events for label sync; default false
 	// RateLimiter throttles outbound sends and usync lookups. Optional; New
 	// installs one built from ratelimit.DefaultConfig when nil. Pass an
 	// explicitly-configured limiter to override the defaults, or leave the
@@ -52,23 +53,26 @@ type Config struct {
 type Client struct {
 	// wa is replaced once by RebindAfterPairing; read it through waClient.
 	// waMu guards wa, handlerID and handlerInstalled.
-	wa               *whatsmeow.Client
-	waMu             sync.RWMutex
-	downloadMedia    func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error)
-	groupInfo        func(context.Context, types.JID) (*types.GroupInfo, error)
-	sendMediaRetry   func(context.Context, *types.MessageInfo, []byte) error
-	store            *store.Store
-	session          *sessionStore // whatsmeow's own database; closed by Close
-	offline          offlineSync   // set once the post-connect backlog has arrived
-	log              waLog.Logger
-	handlerID        uint32
-	handlerInstalled bool
-	allowedMediaRoot string
-	redactor         *security.Redactor
-	limiter          *ratelimit.Limiter
-	labelsEnabled    bool
-	statusMu         sync.RWMutex
-	status           ConnectionStatus
+	wa                 *whatsmeow.Client
+	waMu               sync.RWMutex
+	downloadMedia      func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error)
+	groupInfo          func(context.Context, types.JID) (*types.GroupInfo, error)
+	sendMediaRetry     func(context.Context, *types.MessageInfo, []byte) error
+	store              *store.Store
+	session            *sessionStore // whatsmeow's own database; closed by Close
+	offline            offlineSync   // set once the post-connect backlog has arrived
+	downloads          downloadGate  // bounds concurrent media downloads
+	log                waLog.Logger
+	handlerID          uint32
+	handlerInstalled   bool
+	blockNewRecipients bool
+	// uploadMedia is a test seam for the media upload; nil uses the live client.
+	uploadMedia   func(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	redactor      *security.Redactor
+	limiter       *ratelimit.Limiter
+	labelsEnabled bool
+	statusMu      sync.RWMutex
+	status        ConnectionStatus
 
 	// mediaRetries tracks media retry receipts awaiting the phone's answer
 	// (see mediaretry.go); mediaRetryTimeout overrides
@@ -190,16 +194,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// fall back to waClient(), and isConnected and waSend resolve it on each
 	// call: none of them may capture wa, which RebindAfterPairing replaces.
 	c := &Client{
-		wa:               wa,
-		store:            cfg.Store,
-		session:          container,
-		log:              logger,
-		allowedMediaRoot: cfg.AllowedMediaRoot,
-		redactor:         redactor,
-		limiter:          limiter,
-		labelsEnabled:    cfg.LabelsEnabled,
-		status:           ConnectionStatus{State: "disconnected", Since: time.Now().UTC()},
-		transcribeCfg:    transcribe.ConfigFromEnv(),
+		wa:                 wa,
+		store:              cfg.Store,
+		session:            container,
+		log:                logger,
+		blockNewRecipients: cfg.BlockNewRecipients,
+		redactor:           redactor,
+		limiter:            limiter,
+		labelsEnabled:      cfg.LabelsEnabled,
+		status:             ConnectionStatus{State: "disconnected", Since: time.Now().UTC()},
+		transcribeCfg:      transcribe.ConfigFromEnv(),
 	}
 	c.isConnected = func() bool { return c.waClient().IsConnected() }
 	c.waSend = func(ctx context.Context, to types.JID, msg *waProto.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
@@ -217,14 +221,6 @@ func (c *Client) waClient() *whatsmeow.Client {
 	c.waMu.RLock()
 	defer c.waMu.RUnlock()
 	return c.wa
-}
-
-// ValidateMediaPath is a bound convenience wrapper around
-// security.ValidateMediaPath that uses the client's configured allowlist
-// root. Callers inside internal/client and internal/mcp should prefer this
-// over calling the package-level helper directly.
-func (c *Client) ValidateMediaPath(userPath string) (string, error) {
-	return security.ValidateMediaPath(userPath, c.allowedMediaRoot)
 }
 
 // IsLoggedIn reports whether the underlying whatsmeow device has a stored

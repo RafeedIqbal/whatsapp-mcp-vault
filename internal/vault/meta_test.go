@@ -287,3 +287,64 @@ func TestMetaFileHoldsNoUsableSecret(t *testing.T) {
 		}
 	}
 }
+
+// Anyone who can reach the sign-in page can pause passphrase sign-in by
+// guessing wrong. The recovery code is the owner's way through that: it is far
+// too long to guess, so it is never paused and never adds to the count.
+func TestRecoveryCodeWorksDuringALockoutAndDoesNotExtendIt(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{t: time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)}
+	m := openTestMeta(t, t.TempDir(), clock)
+	key, recovery, _ := m.Initialize(ctx, goodPassphrase)
+	for i := 0; i < maxFreeAttempts; i++ {
+		m.UnlockWithPassphrase(ctx, "a wrong guess, again")
+	}
+	var locked *LockedOutError
+	if _, err := m.UnlockWithPassphrase(ctx, goodPassphrase); !errors.As(err, &locked) {
+		t.Fatalf("precondition: passphrase sign-in should be paused (err=%v)", err)
+	}
+
+	got, err := m.UnlockWithRecoveryCode(ctx, recovery)
+	if err != nil || got != key {
+		t.Fatalf("recovery code during a lockout: same key=%v err=%v", got == key, err)
+	}
+	// Wrong recovery codes are refused but do not lengthen the passphrase pause.
+	until := locked.Until
+	for i := 0; i < 10; i++ {
+		if _, err := m.UnlockWithRecoveryCode(ctx, "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA"); !errors.Is(err, ErrWrongSecret) {
+			t.Fatalf("wrong recovery code err = %v, want ErrWrongSecret", err)
+		}
+	}
+	if _, err := m.UnlockWithPassphrase(ctx, goodPassphrase); !errors.As(err, &locked) || !locked.Until.Equal(until) {
+		t.Fatalf("wrong recovery codes changed the passphrase pause: %v (was until %v)", err, until)
+	}
+}
+
+func TestUnlockAcceptsEitherThePassphraseOrTheRecoveryCode(t *testing.T) {
+	ctx := context.Background()
+	m := openTestMeta(t, t.TempDir(), nil)
+	key, recovery, _ := m.Initialize(ctx, goodPassphrase)
+	for name, secret := range map[string]string{
+		"passphrase":                goodPassphrase,
+		"recovery code":             recovery,
+		"recovery code, lower case": strings.ToLower(recovery),
+		"recovery code, spaced":     strings.ReplaceAll(recovery, "-", " "),
+	} {
+		if got, err := m.Unlock(ctx, secret); err != nil || got != key {
+			t.Errorf("%s: same key=%v err=%v", name, got == key, err)
+		}
+	}
+	if _, err := m.Unlock(ctx, "neither of the two secrets"); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("wrong secret err = %v", err)
+	}
+	// A passphrase that merely looks like a recovery code is still a passphrase.
+	m2 := openTestMeta(t, t.TempDir(), nil)
+	lookalike := "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789"
+	k2, _, err := m2.Initialize(ctx, lookalike)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m2.Unlock(ctx, lookalike); err != nil || got != k2 {
+		t.Fatalf("a passphrase shaped like a recovery code does not unlock: %v", err)
+	}
+}

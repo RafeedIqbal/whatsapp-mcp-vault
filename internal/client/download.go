@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"go.mau.fi/whatsmeow"
 )
@@ -15,6 +16,27 @@ import (
 // held in memory (it is never written to disk), so the cap bounds how much of
 // the instance's RAM one request can take.
 const maxMediaBytes uint64 = 64 << 20
+
+// maxConcurrentDownloads bounds how many media files are being fetched (and
+// so held in memory) at once.
+const maxConcurrentDownloads = 2
+
+// downloadGate limits concurrent downloads. The zero value is ready to use.
+type downloadGate struct {
+	once  sync.Once
+	slots chan struct{}
+}
+
+// acquire waits for a free slot until ctx ends. The returned func frees it.
+func (g *downloadGate) acquire(ctx context.Context) (func(), bool) {
+	g.once.Do(func() { g.slots = make(chan struct{}, maxConcurrentDownloads) })
+	select {
+	case g.slots <- struct{}{}:
+		return func() { <-g.slots }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
 
 // DownloadResult is the public return value from Download. Data holds the
 // decrypted bytes; it is the only copy, and it is not serialised.
@@ -112,7 +134,7 @@ func (c *Client) download(ctx context.Context, messageID, chatJID string, mediaR
 		MediaType:     waMediaType,
 	}
 
-	data, err := c.fetchMedia(ctx, downloader)
+	data, err := c.fetchGated(ctx, downloader)
 	var retriedDirectPath string
 	if err != nil && mediaRetry && isExpiredMediaError(err) {
 		// The stored CDN path has expired (typical for history-synced
@@ -125,7 +147,7 @@ func (c *Client) download(ctx context.Context, messageID, chatJID string, mediaR
 		}
 		downloader.DirectPath = newPath
 		retriedDirectPath = newPath
-		data, err = c.fetchMedia(ctx, downloader)
+		data, err = c.fetchGated(ctx, downloader)
 	}
 	if err != nil {
 		return fail("failed to download media: %v", err)
@@ -149,6 +171,21 @@ func (c *Client) download(ctx context.Context, messageID, chatJID string, mediaR
 		Size:      len(data),
 		Data:      data,
 	}
+}
+
+// errTooManyDownloads is returned when no download slot frees up in time.
+var errTooManyDownloads = errors.New("too many downloads are in progress; try again in a moment")
+
+// fetchGated is fetchMedia under the concurrent-download cap. The cap covers
+// the fetch itself, where a whole file is read into memory; a caller that is
+// only waiting for the phone to re-upload a file does not hold a slot.
+func (c *Client) fetchGated(ctx context.Context, d *MediaDownloader) ([]byte, error) {
+	release, ok := c.downloads.acquire(ctx)
+	if !ok {
+		return nil, errTooManyDownloads
+	}
+	defer release()
+	return c.fetchMedia(ctx, d)
 }
 
 // fetchMedia downloads and decrypts the payload described by d.

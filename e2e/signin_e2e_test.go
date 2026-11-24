@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -140,6 +141,42 @@ func (d *signInDaemon) rpc(token, method string) (int, map[string]any, http.Head
 	return resp.StatusCode, out, resp.Header
 }
 
+// call invokes a tool and returns the HTTP status and decoded reply.
+func (d *signInDaemon) call(token, tool string, args map[string]any) (int, map[string]any, http.Header) {
+	d.t.Helper()
+	if args == nil {
+		args = map[string]any{}
+	}
+	payload, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": tool, "arguments": args}})
+	req, _ := http.NewRequest(http.MethodPost, d.base+"/mcp", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, raw := d.do(req)
+	var out map[string]any
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimPrefix(strings.TrimSpace(line), "data: ")
+		if strings.HasPrefix(line, "{") && json.Unmarshal([]byte(line), &out) == nil {
+			break
+		}
+	}
+	return resp.StatusCode, out, resp.Header
+}
+
+// toolText is the first text block of a tool reply (or its error message).
+func toolText(reply map[string]any) string {
+	if e, ok := reply["error"].(map[string]any); ok {
+		return fmt.Sprint(e["message"])
+	}
+	result, _ := reply["result"].(map[string]any)
+	content, _ := result["content"].([]any)
+	if len(content) == 0 {
+		return ""
+	}
+	first, _ := content[0].(map[string]any)
+	return fmt.Sprint(first["text"])
+}
+
 func (d *signInDaemon) toolNames(token string) map[string]bool {
 	d.t.Helper()
 	status, out, _ := d.rpc(token, "tools/list")
@@ -255,6 +292,40 @@ func TestPassphraseSignInEndToEnd(t *testing.T) {
 	}
 	d.waitForLog("instance unlocked", 1, 30*time.Second)
 
+	// Attach a file from the user's own device: the send tier can create a
+	// one-time upload page, the read tier cannot.
+	if read["create_upload_link"] || !send["create_upload_link"] {
+		t.Fatalf("create_upload_link: read=%v send=%v", read["create_upload_link"], send["create_upload_link"])
+	}
+	_, linkReply, _ := d.call(sendToken, "create_upload_link", nil)
+	var link struct {
+		UploadURL string `json:"upload_url"`
+		UploadID  string `json:"upload_id"`
+	}
+	if err := json.Unmarshal([]byte(toolText(linkReply)), &link); err != nil || !strings.HasPrefix(link.UploadURL, d.base+"/upload/") {
+		t.Fatalf("create_upload_link reply: %v", linkReply)
+	}
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("file", "note.txt")
+	fw.Write([]byte("UPLOAD_MARKER_e2e_attachment"))
+	mw.Close()
+	upReq, _ := http.NewRequest(http.MethodPost, link.UploadURL, &body)
+	upReq.Header.Set("Content-Type", mw.FormDataContentType())
+	if resp, page := d.do(upReq); resp.StatusCode != http.StatusOK {
+		t.Fatalf("upload: status %d %s", resp.StatusCode, page)
+	}
+	// The upload is accepted by send_file (it gets as far as needing WhatsApp,
+	// which this test instance is not linked to) and is then spent.
+	_, sendReply, _ := d.call(sendToken, "send_file", map[string]any{"recipient": "15550009999", "upload_id": link.UploadID})
+	if text := toolText(sendReply); !strings.Contains(text, "Not connected to WhatsApp") {
+		t.Fatalf("send_file with an uploaded file: %s", text)
+	}
+	_, again, _ := d.call(sendToken, "send_file", map[string]any{"recipient": "15550009999", "upload_id": link.UploadID})
+	if text := toolText(again); !strings.Contains(text, "no such upload") {
+		t.Fatalf("the same upload was accepted twice: %s", text)
+	}
+
 	// On disk: only the state database is readable, and it holds no secret.
 	err := filepath.WalkDir(d.storeDir, func(p string, e fs.DirEntry, err error) error {
 		if err != nil || e.IsDir() {
@@ -274,7 +345,7 @@ func TestPassphraseSignInEndToEnd(t *testing.T) {
 			}
 			return nil
 		}
-		for _, needle := range []string{"SQLite format 3", "CREATE TABLE", "whatsmeow_device"} {
+		for _, needle := range []string{"SQLite format 3", "CREATE TABLE", "whatsmeow_device", "UPLOAD_MARKER_e2e_attachment"} {
 			if bytes.Contains(b, []byte(needle)) {
 				t.Errorf("%s contains %q in the clear", name, needle)
 			}

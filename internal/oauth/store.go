@@ -128,7 +128,21 @@ func (s *Store) RegisterClient(ctx context.Context, name string, redirectURIs []
 		return Client{}, fmt.Errorf("count clients: %w", err)
 	}
 	if n >= maxClients {
-		return Client{}, ErrTooManyClients
+		// Make room by dropping the oldest client nobody is signed in with.
+		// A flood of throwaway registrations then costs the flooder its own
+		// registrations, not a real client's ability to register.
+		now := s.now().Unix()
+		res, err := s.db.ExecContext(ctx, `DELETE FROM oauth_clients WHERE client_id = (
+			SELECT c.client_id FROM oauth_clients c
+			WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.client_id AND t.revoked_at = 0 AND t.expires_at > ?)
+			  AND NOT EXISTS (SELECT 1 FROM oauth_codes k WHERE k.client_id = c.client_id AND k.expires_at > ?)
+			ORDER BY c.created_at ASC, c.rowid ASC LIMIT 1)`, now, now)
+		if err != nil {
+			return Client{}, fmt.Errorf("make room for client: %w", err)
+		}
+		if evicted, _ := res.RowsAffected(); evicted == 0 {
+			return Client{}, ErrTooManyClients
+		}
 	}
 	id, err := randomString(16)
 	if err != nil {
@@ -344,6 +358,9 @@ func (s *Store) Refresh(ctx context.Context, refreshToken, clientID string) (Tok
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.dropStaleSuccessorsLocked(ctx); err != nil {
+		return TokenPair{}, err
+	}
 	var g Grant
 	var wrapped, successor []byte
 	var expires, revoked, rotated int64
@@ -371,7 +388,9 @@ func (s *Store) Refresh(ctx context.Context, refreshToken, clientID string) (Tok
 				}
 			}
 		}
-		if _, err := s.db.ExecContext(ctx, `UPDATE oauth_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at = 0`, now.Unix(), g.FamilyID); err != nil {
+		// Deleted, not flagged: a revoked row must not keep a sealed copy of
+		// the key (or the replacement tokens) lying in the state database.
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE family_id = ?`, g.FamilyID); err != nil {
 			return TokenPair{}, fmt.Errorf("revoke sign-in after token reuse: %w", err)
 		}
 		return TokenPair{}, ErrInvalidGrant
@@ -398,7 +417,10 @@ func (s *Store) Refresh(ctx context.Context, refreshToken, clientID string) (Tok
 	if err != nil {
 		return TokenPair{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE oauth_tokens SET rotated_at = ?, successor = ? WHERE id = ?`, now.Unix(), sealed, id); err != nil {
+	// The retired token keeps its row (so later reuse is detected) and, for
+	// the grace window only, the sealed replacement pair. Its sealed copy of
+	// the key is dropped now: a retired token must not still open the vault.
+	if _, err := tx.ExecContext(ctx, `UPDATE oauth_tokens SET rotated_at = ?, successor = ?, wrapped_key = x'' WHERE id = ?`, now.Unix(), sealed, id); err != nil {
 		return TokenPair{}, fmt.Errorf("retire refresh token: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -407,12 +429,12 @@ func (s *Store) Refresh(ctx context.Context, refreshToken, clientID string) (Tok
 	return pair, nil
 }
 
-// RevokeAll ends every sign-in: all tokens stop working and pending codes are
-// discarded. Clients have to sign in again with the passphrase.
+// RevokeAll ends every sign-in: all tokens are deleted (with their sealed
+// keys) and pending codes are discarded. Clients have to sign in again with the passphrase.
 func (s *Store) RevokeAll(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.ExecContext(ctx, `UPDATE oauth_tokens SET revoked_at = ? WHERE revoked_at = 0`, s.now().Unix()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_tokens`); err != nil {
 		return fmt.Errorf("revoke tokens: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_codes`); err != nil {
@@ -429,8 +451,21 @@ func (s *Store) PurgeExpired(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE expires_at <= ?`, now); err != nil {
 		return fmt.Errorf("purge tokens: %w", err)
 	}
+	if err := s.dropStaleSuccessorsLocked(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_codes WHERE expires_at <= ?`, now); err != nil {
 		return fmt.Errorf("purge sign-in codes: %w", err)
+	}
+	return nil
+}
+
+// dropStaleSuccessorsLocked removes replacement token pairs that are past the
+// grace window in which a retry could still ask for them. mu must be held.
+func (s *Store) dropStaleSuccessorsLocked(ctx context.Context) error {
+	cutoff := s.now().Add(-refreshGrace).Unix()
+	if _, err := s.db.ExecContext(ctx, `UPDATE oauth_tokens SET successor = NULL WHERE successor IS NOT NULL AND rotated_at != 0 AND rotated_at < ?`, cutoff); err != nil {
+		return fmt.Errorf("drop stale replacement tokens: %w", err)
 	}
 	return nil
 }
@@ -451,7 +486,10 @@ func parseSecret(s, prefix string) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(body)
+	// Strict: only the one canonical spelling of a credential is accepted.
+	// Lenient decoding ignores the last character's unused bits, so several
+	// different strings would otherwise all be the same token.
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(body)
 	if err != nil || len(raw) != tokenBytes {
 		return nil, false
 	}

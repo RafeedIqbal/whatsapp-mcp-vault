@@ -27,6 +27,12 @@ type Server struct {
 	cache         pairingCache
 	readOnly      bool
 	labelsEnabled bool
+	files         *Files // nil: no link fetching, upload page or download links
+
+	confirm        ConfirmMode
+	drafts         *draftStore
+	confirmable    map[string]bool
+	isNewRecipient func(recipient string) bool
 }
 
 // NewServer constructs an MCP server with all tools registered against the
@@ -62,17 +68,20 @@ func NewServerWithAccess(c *client.Client, cache pairingCache, labelsEnabled boo
 }
 
 func newServer(c *client.Client, cache pairingCache, readOnly, labelsEnabled bool) *Server {
-	instructions := ""
+	instructions := baseInstructions
 	if readOnly {
-		instructions = "This server is in read-only mode: tools cannot send messages or mutate the WhatsApp account. Downloads and history requests can still retrieve data and write the local cache. An explicit media download may ask your own phone to re-upload an expired attachment; it never notifies the sender or chat. Pairing remains an operator action through /pair."
+		instructions += " This server is in read-only mode: tools cannot send messages or mutate the WhatsApp account. Downloads and history requests can still retrieve data and write the local cache. An explicit media download may ask your own phone to re-upload an expired attachment; it never notifies the sender or chat. Pairing remains an operator action through /pair."
 	}
-	mcpSrv := server.NewMCPServer(
+	s := &Server{client: c, cache: cache, readOnly: readOnly, labelsEnabled: labelsEnabled,
+		drafts: newDraftStore(), confirmable: defaultConfirmable()}
+	s.isNewRecipient = func(recipient string) bool { return s.client != nil && s.client.RecipientIsNew(recipient) }
+	s.mcp = server.NewMCPServer(
 		"whatsapp",
 		Version,
 		server.WithToolCapabilities(true),
 		server.WithInstructions(instructions),
+		server.WithToolHandlerMiddleware(s.confirmMiddleware),
 	)
-	s := &Server{client: c, mcp: mcpSrv, cache: cache, readOnly: readOnly, labelsEnabled: labelsEnabled}
 	s.registerTools()
 	if readOnly {
 		for name := range s.mcp.ListTools() {
@@ -93,6 +102,9 @@ func (s *Server) MCP() *server.MCPServer { return s.mcp }
 func (s *Server) AttachHTTP(mux *http.ServeMux) {
 	// Stateless: nothing here is session-scoped (the pairing cache is process-wide
 	// device state), so legacy clients get no Mcp-Session-Id either.
-	httpHandler := server.NewStreamableHTTPServer(s.mcp, server.WithStateLess(true))
+	// No long-lived GET stream either: the server never pushes anything, and
+	// an open stream would count as the instance being in use, so it could
+	// never lock when idle.
+	httpHandler := server.NewStreamableHTTPServer(s.mcp, server.WithStateLess(true), server.WithDisableStreaming(true))
 	mux.Handle("/mcp", httpHandler)
 }

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/sealjay/mcp-whatsapp/internal/gateway"
 	mcpsrv "github.com/sealjay/mcp-whatsapp/internal/mcp"
 	"github.com/sealjay/mcp-whatsapp/internal/oauth"
+	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"github.com/sealjay/mcp-whatsapp/internal/session"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
@@ -39,6 +41,23 @@ func checkServeMode(envKey, allowRemote bool) error {
 			"Unset it to use passphrase sign-in before allowing remote connections", vaultKeyEnv)
 	}
 	return nil
+}
+
+// resolveAllowRemote decides whether binding beyond this machine is allowed:
+// the -allow-remote flag when given, otherwise WHATSAPP_MCP_ALLOW_REMOTE.
+func resolveAllowRemote(flagSet, flagValue bool, getenv func(string) string) (bool, error) {
+	if flagSet {
+		return flagValue, nil
+	}
+	v := strings.TrimSpace(getenv("WHATSAPP_MCP_ALLOW_REMOTE"))
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, errors.New("WHATSAPP_MCP_ALLOW_REMOTE must be a boolean (for example, 1 or 0)")
+	}
+	return b, nil
 }
 
 // resolvePublicURL is the address clients reach this instance at. Sign-in
@@ -90,13 +109,17 @@ func idleLockFromEnv(getenv func(string) string) (time.Duration, error) {
 }
 
 type vaultServeOptions struct {
-	storeDir         string
-	addr             string
-	redactor         *security.Redactor
-	allowedMediaRoot string
-	readOnly         bool
-	labelsEnabled    bool
-	fullHistory      bool
+	storeDir      string
+	addr          string
+	redactor      *security.Redactor
+	readOnly      bool
+	labelsEnabled bool
+	fullHistory   bool
+	policy        sendPolicy
+	// files and limiter outlive lock/unlock: links stay addressable, and the
+	// send limit cannot be reset by letting the instance lock.
+	files   *mcpsrv.Files
+	limiter *ratelimit.Limiter
 }
 
 // instance is everything that exists only while unlocked: the stores, the
@@ -108,6 +131,7 @@ type instance struct {
 	cancel context.CancelFunc
 	owner  http.Handler
 	tools  map[mcpsrv.Access]http.Handler
+	files  *mcpsrv.Files
 	forced *mcpsrv.Access // set in read-only mode: every sign-in gets this
 }
 
@@ -125,6 +149,9 @@ func (r *instance) Owner() http.Handler { return r.owner }
 func (r *instance) Close() error {
 	r.cancel()
 	r.d.Shutdown()
+	if r.files != nil && r.files.Transfers != nil {
+		r.files.Transfers.Clear() // nothing decrypted stays in memory once locked
+	}
 	err := errors.Join(r.c.Close(), r.st.Close())
 	fmt.Fprintln(os.Stderr, "instance locked: disconnected from WhatsApp, databases closed, key discarded")
 	return err
@@ -133,6 +160,28 @@ func (r *instance) Close() error {
 // syncWait bounds how long an unlock waits for WhatsApp to deliver what
 // arrived while the instance was locked.
 const syncWait = 20 * time.Second
+
+// connectWithRetry keeps calling connect, waiting longer after each failure,
+// until it succeeds or ctx ends (the instance locked).
+func connectWithRetry(ctx context.Context, connect func(context.Context) error, after func(time.Duration) <-chan time.Time) {
+	delay := 15 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := connect(ctx); err == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-after(delay):
+		}
+		if delay < 5*time.Minute {
+			delay *= 2
+		}
+	}
+}
 
 // buildRuntime returns the function that brings the instance up from its key.
 func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instance, error) {
@@ -148,15 +197,18 @@ func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instan
 			_ = st.Close()
 			return nil, err
 		}
-		c, err := client.New(runCtx, client.Config{
-			StoreDir:         o.storeDir,
-			Key:              key,
-			Store:            st,
-			Logger:           client.NewStderrLogger("Client", "INFO", false),
-			AllowedMediaRoot: o.allowedMediaRoot,
-			Redactor:         o.redactor,
-			LabelsEnabled:    o.labelsEnabled,
-			FullHistory:      o.fullHistory,
+		// ctx carries the unlock deadline, so a stalled start-up call cannot
+		// hold the unlock forever. New does not keep it.
+		c, err := client.New(ctx, client.Config{
+			StoreDir:           o.storeDir,
+			Key:                key,
+			Store:              st,
+			Logger:             client.NewStderrLogger("Client", "INFO", false),
+			Redactor:           o.redactor,
+			LabelsEnabled:      o.labelsEnabled,
+			FullHistory:        o.fullHistory,
+			RateLimiter:        o.limiter,
+			BlockNewRecipients: o.policy.blockNewRecipients,
 		})
 		if err != nil {
 			return fail(fmt.Errorf("init client: %w", err))
@@ -167,21 +219,25 @@ func buildRuntime(o vaultServeOptions) func(context.Context, vault.Key) (*instan
 			return fail(fmt.Errorf("init pairing: %w", err))
 		}
 
-		rt := &instance{st: st, c: c, d: d, cancel: cancel, owner: d.Handler(), tools: map[mcpsrv.Access]http.Handler{}}
+		rt := &instance{st: st, c: c, d: d, cancel: cancel, owner: d.Handler(), tools: map[mcpsrv.Access]http.Handler{}, files: o.files}
 		for _, access := range []mcpsrv.Access{{}, {Send: true}, {Manage: true}, {Send: true, Manage: true}} {
+			tools := mcpsrv.NewServerWithAccess(c, d.Cache(), o.labelsEnabled, access)
+			tools.SetFiles(o.files)
+			tools.SetSendConfirmation(o.policy.effectiveConfirm())
 			mux := http.NewServeMux()
-			mcpsrv.NewServerWithAccess(c, d.Cache(), o.labelsEnabled, access).AttachHTTP(mux)
+			tools.AttachHTTP(mux)
 			rt.tools[access] = mux
 		}
 		if o.readOnly {
 			rt.forced = &mcpsrv.Access{}
 		}
 
+		// Not reaching WhatsApp must not make the archive unreadable: reading
+		// and searching work offline. Unlock anyway and keep trying to connect.
 		if err := d.Boot(runCtx); err != nil {
-			_ = rt.Close()
-			return nil, fmt.Errorf("connect: %w", err)
-		}
-		if c.IsLoggedIn() {
+			fmt.Fprintf(os.Stderr, "unlock: could not connect to WhatsApp (%s); the archive is available and connecting will be retried\n", o.redactor.Err(err))
+			go connectWithRetry(runCtx, d.Boot, time.After)
+		} else if c.IsLoggedIn() {
 			if !c.WaitForOfflineSync(ctx, syncWait) {
 				fmt.Fprintln(os.Stderr, "unlock: WhatsApp has not finished delivering the backlog yet; answering with what has arrived")
 			}
@@ -202,6 +258,8 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 		return 2
 	}
+	o.files = newFiles(publicURL)
+	o.limiter = ratelimit.New(ratelimit.DefaultConfig())
 	if err := os.MkdirAll(o.storeDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "create store dir: %v\n", err)
 		return 1
@@ -224,14 +282,18 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 			extraRedirects = append(extraRedirects, u)
 		}
 	}
-	signIn := oauth.NewServer(oauth.Config{Issuer: publicURL, Store: tokens, Unlock: meta.UnlockWithPassphrase, ExtraRedirectURIs: extraRedirects})
+	// meta.Unlock takes the passphrase or the recovery code; the recovery code
+	// is never paused by wrong guesses, so the owner always has a way in.
+	signIn := oauth.NewServer(oauth.Config{Issuer: publicURL, Store: tokens, Unlock: meta.Unlock, ExtraRedirectURIs: extraRedirects})
 	sessions := session.New(buildRuntime(o), idle)
 	gw := gateway.New(gateway.Config[*instance]{
 		Meta:          meta,
 		OAuth:         signIn,
 		Sessions:      sessions,
 		SetupToken:    strings.TrimSpace(os.Getenv("SETUP_TOKEN")),
+		RevokeAll:     tokens.RevokeAll,
 		SecureCookies: strings.HasPrefix(publicURL, "https://"),
+		Extra:         o.files.Transfers.Mount,
 		Logf:          func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },
 	})
 
@@ -254,6 +316,9 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		sessions.Run(ctx, 5*time.Second) // locks when idle, and on shutdown
 		close(lockerDone)
 	}()
+	// Owner sign-ins hold the key too; drop them when idle even if the owner
+	// just closed the tab.
+	go gw.Run(ctx, 5*time.Second)
 	go func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
