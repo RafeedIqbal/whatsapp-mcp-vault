@@ -41,6 +41,11 @@ jobs:
       - run: go test -race -coverprofile=cover.out ./...
       - run: go tool cover -func=cover.out | tail -1
       - run: go build ./...
+      - run: make e2e
+      - name: Build and smoke-test the Linux image
+        run: |
+          docker build --tag whatsapp-vault:ci .
+          docker run --rm --network none --env WHATSAPP_MCP_VAULT_KEY="$(openssl rand -hex 32)" whatsapp-vault:ci smoke
       - name: mdtest parity grep
         # Fails if a whatsmeow method we call disappears upstream — an early
         # signal that the API was removed or renamed.

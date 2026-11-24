@@ -259,6 +259,7 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		return 2
 	}
 	o.files = newFiles(publicURL)
+	go o.files.Transfers.Run(ctx)
 	o.limiter = ratelimit.New(ratelimit.DefaultConfig())
 	if err := os.MkdirAll(o.storeDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "create store dir: %v\n", err)
@@ -292,6 +293,7 @@ func runVaultServe(ctx context.Context, o vaultServeOptions) int {
 		Sessions:      sessions,
 		SetupToken:    strings.TrimSpace(os.Getenv("SETUP_TOKEN")),
 		RevokeAll:     tokens.RevokeAll,
+		OwnerIdle:     idle,
 		SecureCookies: strings.HasPrefix(publicURL, "https://"),
 		Extra:         o.files.Transfers.Mount,
 		Logf:          func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },

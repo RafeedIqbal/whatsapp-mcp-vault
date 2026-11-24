@@ -25,6 +25,7 @@ func TestPollTimestampMigrationAndCanonicalWrites(t *testing.T) {
 	defer s.Close()
 
 	if _, err := s.db.Exec(`
+		PRAGMA user_version=0;
 		INSERT INTO poll_votes
 			(poll_message_id, poll_chat_jid, voter_jid, selected_options_json, timestamp)
 		VALUES ('legacy-poll', '123456789@g.us', '447700000001@s.whatsapp.net', '["yes"]', '2026-11-23 09:30:00.123456789-08:00');
@@ -805,4 +806,27 @@ func columnCount(t *testing.T, db *sql.DB, table, column string) int {
 		t.Fatalf("iterate PRAGMA rows: %v", err)
 	}
 	return count
+}
+
+func TestCompletedArchiveMigrationLeavesRowsAlone(t *testing.T) {
+	s := openTestStore(t)
+	if err := migrateSchema(s.db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("CREATE TRIGGER reject_rewrite BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'unexpected rewrite'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchema(s.db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA user_version=0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchema(s.db); err == nil {
+		t.Fatal("expected failed legacy migration")
+	}
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 0 {
+		t.Fatalf("failed migration version %d, err %v", version, err)
+	}
 }

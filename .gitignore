@@ -5,3 +5,6 @@ bin/
 cover.out
 # Anchored: only the repo-root session/data dir, NOT internal/store/
 /store/
+/.local/
+/.claude/worktrees/
+/.superpowers/

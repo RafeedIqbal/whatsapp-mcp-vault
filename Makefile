@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-cover lint vet fmt clean login serve bridge smoke e2e upgrade-check
+.PHONY: build test test-race test-cover lint vet fmt clean login serve smoke e2e upgrade-check
 
 # fmt uses process substitution; force bash so `make lint` works under a POSIX /bin/sh
 SHELL := /bin/bash
@@ -40,11 +40,9 @@ login: build
 serve: build
 	$(BIN) serve
 
-bridge: build
-	$(BIN) bridge
-
 smoke: build
-	$(BIN) smoke
+	@dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
+		WHATSAPP_MCP_VAULT_KEY=$$(openssl rand -hex 32) $(BIN) -store "$$dir" smoke
 
 clean:
 	rm -rf bin cover.out

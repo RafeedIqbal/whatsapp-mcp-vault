@@ -7,14 +7,13 @@
 >
 > This server links to WhatsApp as an unofficial linked device. That is against WhatsApp's Terms of Service and can get an account restricted or banned. Use it at your own risk.
 
-[![License: MIT](https://img.shields.io/github/license/Sealjay/mcp-whatsapp)](LICENSE)
-[![CI](https://github.com/Sealjay/mcp-whatsapp/actions/workflows/ci.yml/badge.svg)](https://github.com/Sealjay/mcp-whatsapp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/RafeedIqbal/whatsapp-mcp-vault)](LICENSE)
+[![CI](https://github.com/RafeedIqbal/whatsapp-mcp-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/RafeedIqbal/whatsapp-mcp-vault/actions/workflows/ci.yml)
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![MCP](https://img.shields.io/badge/MCP-protocol-6366f1)](https://modelcontextprotocol.io/)
 [![43 tools](https://img.shields.io/badge/tools-43-blue)](#tools)
 [![whatsmeow](https://img.shields.io/badge/whatsmeow-multidevice-25D366?logo=whatsapp&logoColor=white)](https://github.com/tulir/whatsmeow)
-[![Sealjay/mcp-whatsapp MCP server](https://glama.ai/mcp/servers/Sealjay/mcp-whatsapp/badges/score.svg?)](https://glama.ai/mcp/servers/Sealjay/mcp-whatsapp)
-[![GitHub issues](https://img.shields.io/github/issues/Sealjay/mcp-whatsapp)](https://github.com/Sealjay/mcp-whatsapp/issues)
+[![GitHub issues](https://img.shields.io/github/issues/RafeedIqbal/whatsapp-mcp-vault)](https://github.com/RafeedIqbal/whatsapp-mcp-vault/issues)
 
 A local-first WhatsApp [MCP](https://modelcontextprotocol.io/) server for AI assistants, built as a single Go binary. Search cached conversations, send messages, manage groups and work with media through your own WhatsApp account. One HTTP daemon maintains the connection and local SQLite cache, and multiple MCP clients can share it.
 
@@ -49,16 +48,19 @@ There are 43 tools advertised by default. That count includes `transcribe_audio`
 ### Install
 
 ```bash
-git clone https://github.com/Sealjay/mcp-whatsapp.git
-cd mcp-whatsapp
+git clone https://github.com/RafeedIqbal/whatsapp-mcp-vault.git
+cd whatsapp-mcp-vault
 make build    # writes ./bin/whatsapp-mcp
 ```
 
 ### Pair your phone (first run only)
 
-Start the daemon. It stays up even when unpaired, so `/pair` is available:
+For local development, create a private key on first use and reuse it each time you start the daemon. Hosted instances use the passphrase setup in [the hosting guide](docs/hosting.md).
 
 ```bash
+mkdir -p .local
+(umask 077; set -C; openssl rand -hex 32 > .local/vault.key)  # first run only
+export WHATSAPP_MCP_VAULT_KEY="$(cat .local/vault.key)"
 ./bin/whatsapp-mcp serve          # listens on 127.0.0.1:8765
 ```
 

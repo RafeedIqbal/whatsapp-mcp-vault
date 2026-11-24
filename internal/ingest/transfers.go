@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -80,6 +81,22 @@ func (t *Transfers) expireLocked() {
 		if !now.Before(it.expires) {
 			t.total -= int64(len(it.blob.Data))
 			delete(t.items, id)
+		}
+	}
+}
+
+// Run drops expired payloads even when nobody visits the instance.
+func (t *Transfers) Run(ctx context.Context) {
+	ticker := time.NewTicker(min(t.ttl, time.Second))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.mu.Lock()
+			t.expireLocked()
+			t.mu.Unlock()
 		}
 	}
 }

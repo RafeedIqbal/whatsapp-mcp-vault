@@ -542,7 +542,7 @@ func TestNormalizeStoredTimestampPrecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := normalizeStoredTimestampPrecision(s.db); err != nil {
+	if err := migrateSchema(s.db); err != nil {
 		t.Fatal(err)
 	}
 	var raw string
@@ -569,7 +569,7 @@ func TestListMessagesTimezoneOffsetBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := normalizeStoredTimestampPrecision(s.db); err != nil {
+	if err := migrateSchema(s.db); err != nil {
 		t.Fatal(err)
 	}
 

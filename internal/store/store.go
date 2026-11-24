@@ -436,7 +436,31 @@ CREATE TABLE IF NOT EXISTS pending_poll_votes (
 // any ALTER. Every step is idempotent — running migrateSchema twice is a
 // no-op on an up-to-date DB.
 func migrateSchema(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(messages)")
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var version int
+	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version > 1 {
+		return fmt.Errorf("unsupported archive schema version %d", version)
+	}
+	if version == 0 {
+		if err := migrateArchive(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("PRAGMA user_version=1"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func migrateArchive(tx *sql.Tx) error {
+	rows, err := tx.Query("PRAGMA table_info(messages)")
 	if err != nil {
 		return fmt.Errorf("pragma table_info(messages): %w", err)
 	}
@@ -474,35 +498,35 @@ func migrateSchema(db *sql.DB) error {
 		return fmt.Errorf("iterate table_info(messages): %w", err)
 	}
 	if !hasPollOptions {
-		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN poll_options_json TEXT"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN poll_options_json TEXT"); err != nil {
 			return fmt.Errorf("add column poll_options_json: %w", err)
 		}
 	}
 	if !hasDirectPath {
-		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN direct_path TEXT"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN direct_path TEXT"); err != nil {
 			return fmt.Errorf("add column direct_path: %w", err)
 		}
 	}
 	if !hasEditedAt {
-		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN edited_at TIMESTAMP"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN edited_at TIMESTAMP"); err != nil {
 			return fmt.Errorf("add column edited_at: %w", err)
 		}
 	}
 	if !hasRevokedAt {
-		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN revoked_at TIMESTAMP"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN revoked_at TIMESTAMP"); err != nil {
 			return fmt.Errorf("add column revoked_at: %w", err)
 		}
 	}
-	if err := ensurePollVoteReceivedAt(db); err != nil {
+	if err := ensurePollVoteReceivedAt(tx); err != nil {
 		return err
 	}
-	if err := normalizePollTimestampPrecision(db); err != nil {
+	if err := normalizePollTimestampPrecision(tx); err != nil {
 		return err
 	}
-	if err := rekeyDevicePollVoters(db); err != nil {
+	if err := rekeyDevicePollVoters(tx); err != nil {
 		return err
 	}
-	return normalizeStoredTimestampPrecision(db)
+	return normalizeStoredTimestampPrecision(tx)
 }
 
 func utcTimestampText(t time.Time) string {
@@ -527,7 +551,7 @@ func parseStoredTimestamp(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func ensurePollVoteReceivedAt(db *sql.DB) error {
+func ensurePollVoteReceivedAt(db *sql.Tx) error {
 	var tableExists int
 	if err := db.QueryRow(
 		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='poll_votes'",
@@ -570,7 +594,7 @@ func ensurePollVoteReceivedAt(db *sql.DB) error {
 	return nil
 }
 
-func normalizePollTimestampPrecision(db *sql.DB) error {
+func normalizePollTimestampPrecision(db *sql.Tx) error {
 	var tableExists int
 	if err := db.QueryRow(
 		"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='poll_votes'",
@@ -697,12 +721,7 @@ func normalizePollTimestampPrecision(db *sql.DB) error {
 	return nil
 }
 
-func normalizeStoredTimestampPrecision(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+func normalizeStoredTimestampPrecision(tx *sql.Tx) error {
 
 	rows, err := tx.Query(`SELECT id, chat_jid, CAST(timestamp AS TEXT),
 		CAST(edited_at AS TEXT), CAST(revoked_at AS TEXT) FROM messages`)
@@ -796,7 +815,7 @@ func normalizeStoredTimestampPrecision(db *sql.DB) error {
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 // devicePollVoter matches voter_jid values carrying a device suffix
@@ -807,19 +826,14 @@ const devicePollVoter = `instr(voter_jid, ':') BETWEEN 2 AND instr(voter_jid, '@
 // rekeyDevicePollVoters moves poll votes stored under a device JID to the
 // account JID, keeping each account's newest selection, so a voter is counted
 // once. Idempotent: no device-suffixed voter remains afterwards.
-func rekeyDevicePollVoters(db *sql.DB) error {
+func rekeyDevicePollVoters(tx *sql.Tx) error {
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'poll_votes'`).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'poll_votes'`).Scan(&n); err != nil {
 		return fmt.Errorf("check poll_votes table: %w", err)
 	}
 	if n == 0 {
 		return nil
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin poll voter rekey: %w", err)
-	}
-	defer tx.Rollback()
 	if _, err := tx.Exec(`INSERT INTO poll_votes
 		 (poll_message_id, poll_chat_jid, voter_jid, selected_options_json, timestamp, received_at)
 		 SELECT poll_message_id, poll_chat_jid,
@@ -839,5 +853,5 @@ func rekeyDevicePollVoters(db *sql.DB) error {
 	if _, err := tx.Exec(`DELETE FROM poll_votes WHERE ` + devicePollVoter); err != nil {
 		return fmt.Errorf("delete device poll voters: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
