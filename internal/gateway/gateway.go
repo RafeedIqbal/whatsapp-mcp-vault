@@ -625,6 +625,9 @@ func (g *Gateway[R]) renderSetup(r *http.Request, w http.ResponseWriter, status 
 		}
 	}
 	oauth.PageHeaders(w, "")
+	// With no-referrer, browsers send Origin: null on form POSTs and the
+	// owner's own submission fails sameOrigin. Keep referrers on this site.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.WriteHeader(status)
 	_ = setupTemplate.Execute(w, v)
 }
