@@ -392,11 +392,14 @@ func TestSetupCannotBeRunTwice(t *testing.T) {
 	}
 }
 
-func TestSetupPagesCannotBeFramedOrCached(t *testing.T) {
+func TestSetupPageBrowserHeaders(t *testing.T) {
 	f := newFixture(t)
 	resp, _ := f.get(http.DefaultClient, "/setup")
 	if resp.Header.Get("X-Frame-Options") != "DENY" || !strings.Contains(resp.Header.Get("Cache-Control"), "no-store") {
 		t.Fatalf("XFO=%q Cache-Control=%q", resp.Header.Get("X-Frame-Options"), resp.Header.Get("Cache-Control"))
+	}
+	if got := resp.Header.Get("Referrer-Policy"); got != "same-origin" {
+		t.Errorf("setup form Referrer-Policy = %q, want same-origin for browser POSTs", got)
 	}
 }
 
